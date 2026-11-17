@@ -1,0 +1,24 @@
+# Core Framework & ASGI Server
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+
+# Database & ORM (Synchronous SQLAlchemy 2.x & psycopg 3)
+sqlalchemy>=2.0.36,<2.1
+psycopg[binary]>=3.2.0
+alembic>=1.14.0
+
+# Validation & Configuration (Pydantic v2)
+pydantic[email]>=2.10.0
+pydantic-settings>=2.6.0
+
+# Security & Authentication
+argon2-cffi>=23.1.0
+pyjwt[crypto]>=2.10.0
+
+# HTTP Client & External Integrations
+httpx>=0.28.0
+resend>=2.6.0
+
+# Testing
+pytest>=8.3.0
+pytest-mock>=3.14.0
