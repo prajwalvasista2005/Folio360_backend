@@ -3,8 +3,11 @@
 import json
 from functools import lru_cache
 from typing import Any, Literal
-from pydantic import field_validator
+
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
 
 
 class Settings(BaseSettings):
@@ -15,6 +18,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=True,
+        hide_input_in_errors=True,
     )
 
     # Application Information
@@ -46,6 +50,17 @@ class Settings(BaseSettings):
     # Documentation Endpoints (can be disabled in production if desired)
     DOCS_URL: str | None = "/docs"
     OPENAPI_URL: str | None = "/openapi.json"
+
+    # Database & Readiness Configuration
+    DATABASE_URL: SecretStr | None = None
+    DB_POOL_SIZE: int = Field(default=5, ge=1, le=50)
+    DB_MAX_OVERFLOW: int = Field(default=10, ge=0, le=100)
+    DB_POOL_TIMEOUT: int = Field(default=30, ge=1, le=120)
+    DB_CONNECT_TIMEOUT: int = Field(default=5, ge=1, le=30)
+    DB_READINESS_MAX_CONCURRENCY: int = Field(default=2, ge=1, le=10)
+    DB_READINESS_CONNECT_TIMEOUT: int = Field(default=3, ge=1, le=4)
+    DB_READINESS_QUERY_TIMEOUT_MS: int = Field(default=1000, ge=100, le=3000)
+    DB_ECHO: bool = False
 
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
@@ -204,6 +219,61 @@ class Settings(BaseSettings):
         if upper_val not in valid_levels:
             raise ValueError(f"Invalid LOG_LEVEL '{value}'. Expected one of {valid_levels}")
         return upper_val
+
+    @field_validator("DATABASE_URL", mode="after")
+    @classmethod
+    def validate_database_url(cls, value: SecretStr | None) -> SecretStr | None:
+        """Validate DATABASE_URL when configured without echoing URL or credentials."""
+        if value is None:
+            return None
+
+        stripped = value.get_secret_value().strip()
+        if not stripped:
+            raise ValueError("DATABASE_URL must not be empty")
+
+        try:
+            url = make_url(stripped)
+        except (ArgumentError, ValueError):
+            raise ValueError(
+                "Invalid DATABASE_URL format; expected postgresql+psycopg://..."
+            ) from None
+
+        if url.drivername != "postgresql+psycopg":
+            raise ValueError(
+                "DATABASE_URL must use the 'postgresql+psycopg' driver"
+            )
+        if not url.host or not url.host.strip():
+            raise ValueError("DATABASE_URL must include a non-empty host")
+        if not url.database or not url.database.strip():
+            raise ValueError("DATABASE_URL must include a non-empty database name")
+
+        return SecretStr(stripped)
+
+    @model_validator(mode="after")
+    def validate_readiness_budget(self) -> "Settings":
+        """Enforce total readiness probe timeout budget <= 5.0 seconds."""
+        total_budget = self.DB_READINESS_CONNECT_TIMEOUT + (
+            self.DB_READINESS_QUERY_TIMEOUT_MS / 1000.0
+        )
+        if total_budget > 5.0:
+            raise ValueError(
+                "Readiness total timeout budget "
+                "(DB_READINESS_CONNECT_TIMEOUT + DB_READINESS_QUERY_TIMEOUT_MS / 1000.0) "
+                "must not exceed 5.0 seconds"
+            )
+        return self
+
+    def validate_runtime_requirements(self) -> None:
+        """Enforce production runtime requirements at application startup."""
+        if self.ENVIRONMENT == "production":
+            if self.DATABASE_URL is None:
+                raise RuntimeError(
+                    "DATABASE_URL must be configured when ENVIRONMENT is 'production'"
+                )
+            if self.DB_ECHO:
+                raise RuntimeError(
+                    "DB_ECHO must be False when ENVIRONMENT is 'production'"
+                )
 
 
 @lru_cache

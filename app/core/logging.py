@@ -34,7 +34,7 @@ URI_CREDENTIAL_PATTERN = re.compile(
     r'(?i)([a-z][a-z0-9+.-]*://[^:\s/@]+:)(?!\[REDACTED\])([^@\s/]+)(@)'
 )
 CONNECTION_STRING_PATTERN = re.compile(
-    r'(?i)\b(?:postgresql|postgres|mysql|sqlite|mariadb|oracle|mssql|mongodb|redis)://[^\s\'"]+'
+    r'(?i)\b(?:postgresql|postgres|mysql|sqlite|mariadb|oracle|mssql|mongodb|redis)(?:\+[a-z0-9_]+)?://[^\s\'"]+'
 )
 
 # 5. Raw SQL statements pattern (SELECT ... FROM, INSERT INTO, UPDATE ... SET, DELETE FROM, etc.)

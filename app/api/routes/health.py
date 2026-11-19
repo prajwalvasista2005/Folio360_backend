@@ -1,9 +1,13 @@
-"""Health check route reporting service status."""
+"""Health and readiness check routes reporting service status."""
+
+from typing import Literal
 
 from fastapi import APIRouter, Depends, Request, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.core.config import Settings, get_settings
+from app.db.session import check_database_readiness
 
 router = APIRouter(tags=["Health"])
 
@@ -31,6 +35,15 @@ class HealthResponse(BaseModel):
     )
 
 
+class ReadinessResponse(BaseModel):
+    """Schema for database readiness status response."""
+
+    status: Literal["ready", "unavailable"] = Field(
+        description="Database readiness status for serving database-backed requests",
+        examples=["ready"],
+    )
+
+
 @router.get(
     "/health",
     response_model=HealthResponse,
@@ -50,3 +63,37 @@ def check_health(
         application=settings.APP_NAME,
         version=settings.APP_VERSION,
     )
+
+
+@router.get(
+    "/health/ready",
+    response_model=ReadinessResponse,
+    status_code=status.HTTP_200_OK,
+    responses={
+        status.HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ReadinessResponse,
+            "description": "Database is unconfigured, unreachable, timed out, or readiness concurrency limit reached",
+        }
+    },
+    summary="Database readiness check",
+    description=(
+        "Synchronous database readiness probe executing SELECT 1 with bounded "
+        "per-process concurrency via a dedicated NullPool readiness engine."
+    ),
+)
+def readiness_check(
+    request: Request,
+    settings: Settings = Depends(get_current_settings),
+) -> ReadinessResponse | JSONResponse:
+    """Synchronous readiness check verifying PostgreSQL reachability within probe capacity."""
+    is_ready = check_database_readiness(
+        readiness_engine=getattr(request.app.state, "db_readiness_engine", None),
+        readiness_semaphore=getattr(request.app.state, "db_readiness_semaphore", None),
+        settings=settings,
+    )
+    if not is_ready:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"status": "unavailable"},
+        )
+    return ReadinessResponse(status="ready")

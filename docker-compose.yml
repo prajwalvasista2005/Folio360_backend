@@ -1,0 +1,72 @@
+networks:
+  folio360_net:
+    name: folio360_net
+    driver: bridge
+
+volumes:
+  folio360_pg_dev_data:
+    name: folio360_pg_dev_data
+
+services:
+  db:
+    image: postgres:17
+    container_name: folio360_db_dev
+    restart: unless-stopped
+    command: ["postgres", "-c", "password_encryption=scram-sha-256"]
+    ports:
+      - "127.0.0.1:5433:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_DEV_ADMIN_USER:-folio360_dev_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_DEV_ADMIN_PASSWORD:-folio360_dev_admin_pass}
+      POSTGRES_DB: ${POSTGRES_DEV_DB:-folio360_dev}
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256 --encoding=UTF8"
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      APP_DB_USER: ${POSTGRES_DEV_APP_USER:-folio360_dev_user}
+      APP_DB_PASSWORD: ${POSTGRES_DEV_APP_PASSWORD:-folio360_dev_pass}
+    volumes:
+      - folio360_pg_dev_data:/var/lib/postgresql/data
+      - ./docker/postgres/init-least-privilege.sh:/docker-entrypoint-initdb.d/init-least-privilege.sh:ro
+    networks:
+      - folio360_net
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'pg_isready -h 127.0.0.1 -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"',
+        ]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+      start_period: 5s
+
+  db_test:
+    image: postgres:17
+    container_name: folio360_db_test
+    restart: "no"
+    command: ["postgres", "-c", "password_encryption=scram-sha-256"]
+    ports:
+      - "127.0.0.1:5434:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_TEST_ADMIN_USER:-folio360_test_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_TEST_ADMIN_PASSWORD:-folio360_test_admin_pass}
+      POSTGRES_DB: ${POSTGRES_TEST_DB:-folio360_test}
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256 --encoding=UTF8"
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      APP_DB_USER: ${POSTGRES_TEST_APP_USER:-folio360_test_user}
+      APP_DB_PASSWORD: ${POSTGRES_TEST_APP_PASSWORD:-folio360_test_pass}
+    tmpfs:
+      - /var/lib/postgresql/data
+    volumes:
+      - ./docker/postgres/init-least-privilege.sh:/docker-entrypoint-initdb.d/init-least-privilege.sh:ro
+    networks:
+      - folio360_net
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'pg_isready -h 127.0.0.1 -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"',
+        ]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+      start_period: 5s
