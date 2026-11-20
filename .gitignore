@@ -75,3 +75,6 @@ logs/
 # Database / SQLite / Temp files
 *.sqlite3
 *.db
+
+# Frontend / Node
+node_modules/
