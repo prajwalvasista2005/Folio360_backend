@@ -17,13 +17,17 @@ target_metadata = Base.metadata
 
 
 def _get_database_url() -> str:
-    """Resolve DATABASE_URL from Settings without logging or exposing credentials."""
+    """Resolve MIGRATION_DATABASE_URL from Settings without logging or exposing credentials."""
     settings = get_settings()
-    if settings.DATABASE_URL is None:
-        raise RuntimeError("DATABASE_URL must be configured to run Alembic migrations")
-    database_url = settings.DATABASE_URL.get_secret_value().strip()
+    if settings.MIGRATION_DATABASE_URL is None:
+        raise RuntimeError(
+            "MIGRATION_DATABASE_URL must be configured to run Alembic migrations"
+        )
+    database_url = settings.MIGRATION_DATABASE_URL.get_secret_value().strip()
     if not database_url:
-        raise RuntimeError("DATABASE_URL must be configured to run Alembic migrations")
+        raise RuntimeError(
+            "MIGRATION_DATABASE_URL must be configured to run Alembic migrations"
+        )
     return database_url
 
 

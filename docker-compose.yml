@@ -21,8 +21,10 @@ services:
       POSTGRES_DB: ${POSTGRES_DEV_DB:-folio360_dev}
       POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256 --encoding=UTF8"
       POSTGRES_HOST_AUTH_METHOD: scram-sha-256
-      APP_DB_USER: ${POSTGRES_DEV_APP_USER:-folio360_dev_user}
-      APP_DB_PASSWORD: ${POSTGRES_DEV_APP_PASSWORD:-folio360_dev_pass}
+      MIGRATOR_DB_USER: ${POSTGRES_DEV_MIGRATOR_USER:-folio360_dev_migrator}
+      MIGRATOR_DB_PASSWORD: ${POSTGRES_DEV_MIGRATOR_PASSWORD:-folio360_dev_migrator_pass}
+      APP_DB_USER: ${POSTGRES_DEV_APP_USER:-folio360_dev_app}
+      APP_DB_PASSWORD: ${POSTGRES_DEV_APP_PASSWORD:-folio360_dev_app_pass}
     volumes:
       - folio360_pg_dev_data:/var/lib/postgresql/data
       - ./docker/postgres/init-least-privilege.sh:/docker-entrypoint-initdb.d/init-least-privilege.sh:ro
@@ -52,8 +54,10 @@ services:
       POSTGRES_DB: ${POSTGRES_TEST_DB:-folio360_test}
       POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256 --encoding=UTF8"
       POSTGRES_HOST_AUTH_METHOD: scram-sha-256
-      APP_DB_USER: ${POSTGRES_TEST_APP_USER:-folio360_test_user}
-      APP_DB_PASSWORD: ${POSTGRES_TEST_APP_PASSWORD:-folio360_test_pass}
+      MIGRATOR_DB_USER: ${POSTGRES_TEST_MIGRATOR_USER:-folio360_test_migrator}
+      MIGRATOR_DB_PASSWORD: ${POSTGRES_TEST_MIGRATOR_PASSWORD:-folio360_test_migrator_pass}
+      APP_DB_USER: ${POSTGRES_TEST_APP_USER:-folio360_test_app}
+      APP_DB_PASSWORD: ${POSTGRES_TEST_APP_PASSWORD:-folio360_test_app_pass}
     tmpfs:
       - /var/lib/postgresql/data
     volumes:
@@ -70,3 +74,70 @@ services:
       timeout: 5s
       retries: 15
       start_period: 5s
+
+  api:
+    image: folio360-backend:py313
+    build:
+      context: .
+      network: host
+    container_name: folio360_api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      DEBUG: ${DEBUG:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      API_V1_PREFIX: ${API_V1_PREFIX:-/api/v1}
+      CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:3000","http://localhost:5173","http://127.0.0.1:3000","http://127.0.0.1:5173"]}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_DEV_APP_USER:-folio360_dev_app}:${POSTGRES_DEV_APP_PASSWORD:-folio360_dev_app_pass}@db:5432/${POSTGRES_DEV_DB:-folio360_dev}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-dev-only-placeholder-jwt-secret-key-at-least-32-chars}
+      FRONTEND_BASE_URL: ${FRONTEND_BASE_URL:-http://localhost:5173}
+      EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:-no-reply@folio360.local}
+      PROXY_HEADERS_ENABLED: ${PROXY_HEADERS_ENABLED:-false}
+      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-[]}
+    volumes:
+      - .:/app
+    networks:
+      - folio360_net
+    command: ["python", "-m", "app.server", "--host", "0.0.0.0", "--port", "8000"]
+
+  migrator:
+    image: folio360-backend:py313
+    build:
+      context: .
+      network: host
+    profiles: ["tools"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      MIGRATION_DATABASE_URL: postgresql+psycopg://${POSTGRES_DEV_MIGRATOR_USER:-folio360_dev_migrator}:${POSTGRES_DEV_MIGRATOR_PASSWORD:-folio360_dev_migrator_pass}@db:5432/${POSTGRES_DEV_DB:-folio360_dev}
+    volumes:
+      - .:/app
+    networks:
+      - folio360_net
+    command: ["python", "-m", "alembic", "upgrade", "head"]
+
+  test:
+    image: folio360-backend:py313
+    build:
+      context: .
+      network: host
+    profiles: ["test"]
+    depends_on:
+      db_test:
+        condition: service_healthy
+    environment:
+      ENVIRONMENT: testing
+      TEST_DATABASE_URL: postgresql+psycopg://${POSTGRES_TEST_APP_USER:-folio360_test_app}:${POSTGRES_TEST_APP_PASSWORD:-folio360_test_app_pass}@db_test:5432/${POSTGRES_TEST_DB:-folio360_test}
+      TEST_MIGRATION_DATABASE_URL: postgresql+psycopg://${POSTGRES_TEST_MIGRATOR_USER:-folio360_test_migrator}:${POSTGRES_TEST_MIGRATOR_PASSWORD:-folio360_test_migrator_pass}@db_test:5432/${POSTGRES_TEST_DB:-folio360_test}
+    volumes:
+      - .:/app
+    networks:
+      - folio360_net
+    command: ["python", "-m", "pytest", "-o", "cache_dir=/tmp/pytest_cache", "-v"]

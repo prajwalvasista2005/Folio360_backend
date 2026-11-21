@@ -1,25 +1,74 @@
-"""FastAPI application entry point and factory for Folio360."""
+"""FastAPI application entry point, ASGI3 trust-boundary subclass, and factory for Folio360."""
 
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+import inspect
 import logging
+import sys
+from typing import Any, AsyncGenerator
 
 from fastapi import APIRouter, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import Engine
+from starlette.types import Receive, Scope, Send
+import uvicorn.config
 
-from app.api.routes import health
+from app.api.routes import auth, health
 from app.core.config import Settings, get_settings
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import setup_logging
+from app.core.rate_limit import SlidingWindowRateLimiter
 from app.db.session import (
     build_engine,
     build_readiness_engine,
     build_readiness_semaphore,
     build_sessionmaker,
 )
+from app.server import (
+    _ACTIVE_VERIFIED_CONFIG_LOAD,
+    assert_production_lifespan_verified,
+    verify_production_asgi_trust_boundary,
+)
 
 logger = logging.getLogger("folio360.main")
+
+
+class Folio360FastAPI(FastAPI):
+    """FastAPI subclass enforcing pre-socket Config.load() and ASGI3 lifespan gates."""
+
+    @inspect.markcoroutinefunction
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        # 1. Zero-argument Uvicorn Config.load() probe (uvicorn/config.py)
+        if not args and not kwargs:
+            settings: Settings = getattr(self.state, "settings", None) or get_settings()
+            if (
+                settings.ENVIRONMENT == "production"
+                and _ACTIVE_VERIFIED_CONFIG_LOAD.get() is None
+            ):
+                raise RuntimeError(
+                    "Unverified Uvicorn Config.load() rejected in production: "
+                    "launch via app.server (VerifiedUvicornConfig)."
+                )
+            raise TypeError("Folio360FastAPI instance is not a factory")
+
+        # 2. Strict ASGI3 (scope, receive, send) invocation
+        if len(args) != 3 or kwargs:
+            raise TypeError(
+                "Folio360FastAPI requires ASGI3 (scope, receive, send) invocation."
+            )
+        scope, receive, send = args
+        return self._dispatch_asgi(scope, receive, send)
+
+    async def _dispatch_asgi(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        if scope.get("type") in {"http", "websocket"}:
+            settings: Settings = getattr(self.state, "settings", None) or get_settings()
+            if settings.ENVIRONMENT == "production":
+                assert_production_lifespan_verified(self)
+        await super().__call__(scope, receive, send)
 
 
 def _reset_db_state(app: FastAPI) -> None:
@@ -43,6 +92,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     try:
         settings.validate_runtime_requirements()
+        verify_production_asgi_trust_boundary(app, settings)
+
         if settings.DATABASE_URL is not None:
             db_engine = build_engine(settings)
             db_sessionmaker = build_sessionmaker(db_engine)
@@ -86,12 +137,25 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                     )
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
-    """FastAPI application factory."""
+def create_app(settings: Settings | None = None) -> Folio360FastAPI:
+    """FastAPI application factory (never self-certifies Uvicorn proxy/ASGI state)."""
+    active_config = _ACTIVE_VERIFIED_CONFIG_LOAD.get()
     if settings is None:
-        settings = get_settings()
+        if active_config is not None and active_config._bound_settings is not None:
+            settings = active_config._bound_settings
+        else:
+            settings = get_settings()
 
-    app = FastAPI(
+    # Guard 1: Block direct factory invocation from raw uvicorn.config.Config.load() in production
+    if settings.ENVIRONMENT == "production" and active_config is None:
+        caller_frame = sys._getframe(1)
+        if caller_frame.f_code is uvicorn.config.Config.load.__code__:
+            raise RuntimeError(
+                "Unverified Uvicorn Config.load() factory invocation rejected in production: "
+                "launch via app.server (VerifiedUvicornConfig)."
+            )
+
+    application = Folio360FastAPI(
         title=settings.APP_NAME,
         version=settings.APP_VERSION,
         description=settings.APP_DESCRIPTION,
@@ -100,16 +164,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
 
-    # Attach settings instance and initialize DB state placeholders without side effects
-    app.state.settings = settings
-    _reset_db_state(app)
+    # Attach settings instance and runtime rate limiter without DB side effects
+    application.state.settings = settings
+    application.state.rate_limiter = SlidingWindowRateLimiter()
+    _reset_db_state(application)
 
     # Centralized exception handling
-    register_exception_handlers(app)
+    register_exception_handlers(application)
 
     # CORS configuration
     if settings.CORS_ORIGINS:
-        app.add_middleware(
+        application.add_middleware(
             CORSMiddleware,
             allow_origins=settings.CORS_ORIGINS,
             allow_credentials=True,
@@ -120,9 +185,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Register API v1 routes
     api_v1_router = APIRouter(prefix=settings.API_V1_PREFIX)
     api_v1_router.include_router(health.router)
-    app.include_router(api_v1_router)
+    api_v1_router.include_router(auth.router)
+    application.include_router(api_v1_router)
 
-    return app
+    return application
 
 
 app = create_app()

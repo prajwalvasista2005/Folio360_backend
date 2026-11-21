@@ -2,7 +2,9 @@
 
 import logging
 from typing import Any, Optional
+
 from fastapi import FastAPI, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.core.logging import sanitize_log_text
@@ -19,7 +21,10 @@ STATUS_DEFAULT_MESSAGES = {
     status.HTTP_401_UNAUTHORIZED: "Unauthorized",
     status.HTTP_403_FORBIDDEN: "Forbidden",
     status.HTTP_404_NOT_FOUND: "Resource not found",
+    status.HTTP_409_CONFLICT: "Conflict",
     HTTP_422_STATUS: "Validation failed",
+    status.HTTP_429_TOO_MANY_REQUESTS: "Too many requests",
+    status.HTTP_503_SERVICE_UNAVAILABLE: "Service unavailable",
 }
 
 SENSITIVE_KEY_SUBSTRINGS = (
@@ -116,12 +121,14 @@ class AppException(Exception):
         status_code: int = status.HTTP_500_INTERNAL_SERVER_ERROR,
         details: Optional[Any] = None,
         public_message: Optional[str] = None,
+        headers: Optional[dict[str, str]] = None,
     ) -> None:
         super().__init__(message)
         self.message = message
         self.status_code = status_code
         self.details = details
         self.public_message = public_message
+        self.headers = headers
 
 
 class ResourceNotFoundError(AppException):
@@ -158,12 +165,31 @@ class ValidationAppError(AppException):
         )
 
 
+def auth_error(
+    *,
+    status_code: int,
+    code: str,
+    public_message: str,
+    internal_message: Optional[str] = None,
+    headers: Optional[dict[str, str]] = None,
+) -> AppException:
+    """Create an AppException carrying a stable machine-readable details.code."""
+    return AppException(
+        message=internal_message or public_message,
+        status_code=status_code,
+        details={"code": code},
+        public_message=public_message,
+        headers=headers,
+    )
+
+
 async def app_exception_handler(request: Request, exc: AppException) -> JSONResponse:
     """
     Handle custom application exceptions and return a structured JSON response.
 
-    Maintains safe public responses and logs internal diagnostics on server errors
-    without exposing raw SQL or connection credentials.
+    Maintains safe public responses, preserves explicit response headers
+    (such as WWW-Authenticate or Retry-After), and logs internal diagnostics on
+    server errors without exposing raw SQL or connection credentials.
     """
     public_message = get_safe_public_message(exc)
     public_details = sanitize_public_details(exc.details, exc.status_code)
@@ -187,6 +213,45 @@ async def app_exception_handler(request: Request, exc: AppException) -> JSONResp
                 "message": public_message,
                 "status_code": exc.status_code,
                 "details": public_details,
+            }
+        },
+        headers=exc.headers,
+    )
+
+
+async def validation_exception_handler(
+    request: Request,
+    exc: RequestValidationError,
+) -> JSONResponse:
+    """
+    Handle Pydantic RequestValidationError and strip 'input' / unsafe 'ctx' values.
+
+    Prevents echoing sensitive request inputs (e.g., plaintext passwords or tokens)
+    back to clients in 422 validation responses.
+    """
+    del request
+    sanitized_errors: list[dict[str, Any]] = []
+    for err in exc.errors():
+        loc = [part if isinstance(part, (str, int)) else str(part) for part in err.get("loc", ())]
+        raw_msg = str(err.get("msg", "Invalid value"))
+        sanitized_errors.append(
+            {
+                "loc": loc,
+                "msg": sanitize_log_text(raw_msg),
+                "type": str(err.get("type", "value_error")),
+            }
+        )
+
+    return JSONResponse(
+        status_code=HTTP_422_STATUS,
+        content={
+            "error": {
+                "message": "Validation failed",
+                "status_code": HTTP_422_STATUS,
+                "details": {
+                    "code": "VALIDATION_ERROR",
+                    "errors": sanitized_errors,
+                },
             }
         },
     )
@@ -222,4 +287,5 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 def register_exception_handlers(app: FastAPI) -> None:
     """Register centralized exception handlers on the FastAPI application."""
     app.add_exception_handler(AppException, app_exception_handler)
+    app.add_exception_handler(RequestValidationError, validation_exception_handler)
     app.add_exception_handler(Exception, unhandled_exception_handler)
