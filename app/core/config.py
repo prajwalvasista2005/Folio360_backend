@@ -210,6 +210,7 @@ class Settings(BaseSettings):
     EMAIL_SEND_TIMEOUT_SECONDS: float = Field(default=5.0, ge=1.0, le=15.0)
     RESEND_API_KEY: SecretStr | None = None
     EMAIL_FROM_ADDRESS: str = "no-reply@folio360.local"
+    PASSWORD_RESET_EXPIRE_MINUTES: int = Field(default=30, ge=5, le=120)
 
     # Stage 3A: Rate Limiting & Uvicorn Proxy Policy
     RATE_LIMIT_ENABLED: bool = True

@@ -516,3 +516,173 @@ def test_authenticated_user_context_immutability_and_single_query_delegation() -
         )
         assert inactive_resp.status_code == 403
         assert inactive_resp.json()["error"]["details"]["code"] == "ACCOUNT_INACTIVE"
+
+
+def test_stage3b_password_reset_settings_and_email_service(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verify PASSWORD_RESET_EXPIRE_MINUTES bounds, reset URL construction, and no secret/token logs."""
+    from app.services.email_service import build_password_reset_url, send_password_reset_email
+
+    defaults = _dev_jwt_settings()
+    assert defaults.PASSWORD_RESET_EXPIRE_MINUTES == 30
+    with pytest.raises(ValidationError):
+        _dev_jwt_settings(PASSWORD_RESET_EXPIRE_MINUTES=4)
+    with pytest.raises(ValidationError):
+        _dev_jwt_settings(PASSWORD_RESET_EXPIRE_MINUTES=121)
+
+    raw_token = "unit-reset-token-abc_123"
+    assert (
+        build_password_reset_url("https://app.folio360.local/", raw_token)
+        == "https://app.folio360.local/reset-password?token=unit-reset-token-abc_123"
+    )
+
+    caplog.set_level("INFO")
+    no_key_result = send_password_reset_email(
+        to_email="victim.user@example.com",
+        raw_token=raw_token,
+        settings=defaults,
+    )
+    assert no_key_result.sent is False
+    assert no_key_result.error_type == "ResendNotConfigured"
+
+    sent_payloads: list[dict] = []
+
+    def fake_send(params):
+        sent_payloads.append(params)
+        return {"id": "re_msg_unit_001"}
+
+    monkeypatch.setattr("app.services.email_service.resend.Emails.send", fake_send)
+    keyed_settings = _dev_jwt_settings(
+        RESEND_API_KEY="re_test_secret_unit_key",
+        FRONTEND_BASE_URL="https://app.folio360.local",
+        PASSWORD_RESET_EXPIRE_MINUTES=30,
+    )
+    ok_result = send_password_reset_email(
+        to_email="victim.user@example.com",
+        raw_token=raw_token,
+        settings=keyed_settings,
+    )
+    assert ok_result.sent is True
+    assert ok_result.provider_message_id == "re_msg_unit_001"
+    assert len(sent_payloads) == 1
+    assert sent_payloads[0]["to"] == ["victim.user@example.com"]
+    assert sent_payloads[0]["subject"] == "Reset your Folio360 password"
+    assert (
+        "https://app.folio360.local/reset-password?token=unit-reset-token-abc_123"
+        in sent_payloads[0]["text"]
+    )
+
+    def failing_send(_params):
+        raise RuntimeError("smtp upstream down")
+
+    monkeypatch.setattr("app.services.email_service.resend.Emails.send", failing_send)
+    fail_result = send_password_reset_email(
+        to_email="victim.user@example.com",
+        raw_token=raw_token,
+        settings=keyed_settings,
+    )
+    assert fail_result.sent is False
+    assert fail_result.error_type == "RuntimeError"
+
+    # Ensure logs NEVER contain raw reset token, email address, or API key
+    joined_logs = "\n".join(rec.getMessage() for rec in caplog.records)
+    assert raw_token not in joined_logs
+    assert "victim.user@example.com" not in joined_logs
+    assert "re_test_secret_unit_key" not in joined_logs
+
+
+def test_stage3b_schemas_and_422_input_stripping() -> None:
+    """Verify Stage 3B schema validation, token stripping, extra='forbid', and 422 input stripping."""
+    from app.schemas.auth import (
+        ChangePasswordRequest,
+        ForgotPasswordRequest,
+        MobilePasswordChangeResponse,
+        ResetPasswordRequest,
+        ResetPasswordResponse,
+        WebPasswordChangeResponse,
+    )
+
+    forgot = ForgotPasswordRequest(email="  Alice@Example.com ")
+    assert str(forgot.email) == "alice@example.com"
+    with pytest.raises(ValidationError):
+        ForgotPasswordRequest(email="alice@example.com", extra_field="nope")
+    with pytest.raises(ValidationError):
+        ForgotPasswordRequest(email="alice smith@example.com")
+    with pytest.raises(ValidationError):
+        ForgotPasswordRequest(email=f"{'a' * 310}@example.com")
+
+    reset_req = ResetPasswordRequest(token="  abc-token-123  ", new_password="ValidPassword!234")
+    assert reset_req.token == "abc-token-123"
+    with pytest.raises(ValidationError):
+        ResetPasswordRequest(token="   ", new_password="ValidPassword!234")
+    with pytest.raises(ValidationError):
+        ResetPasswordRequest(token="abc", new_password="", unexpected=1)
+
+    change_req = ChangePasswordRequest(
+        current_password="O" * 256,
+        new_password="NewPassword!456",
+    )
+    assert len(change_req.current_password) == 256
+    with pytest.raises(ValidationError):
+        ChangePasswordRequest(
+            current_password="OldPassword!123",
+            new_password="NewPassword!456",
+            extra=True,
+        )
+
+    reset_resp = ResetPasswordResponse(message="ok")
+    assert reset_resp.model_dump() == {"message": "ok"}
+
+    now = datetime.now(timezone.utc)
+    user_payload = {
+        "id": uuid.uuid4(),
+        "email": "alice@example.com",
+        "is_active": True,
+        "is_email_verified": True,
+        "has_password": True,
+        "created_at": now,
+    }
+    web_resp = WebPasswordChangeResponse(
+        access_token="jwt-token",
+        expires_in=900,
+        user=user_payload,
+    )
+    assert "refresh_token" not in web_resp.model_dump()
+    assert web_resp.message == "Password updated successfully."
+
+    mobile_resp = MobilePasswordChangeResponse(
+        access_token="jwt-token",
+        expires_in=900,
+        refresh_token="raw-refresh-token",
+        refresh_expires_in=604800,
+        user=user_payload,
+    )
+    assert mobile_resp.refresh_token == "raw-refresh-token"
+    assert mobile_resp.message == "Password updated successfully."
+
+    # Verify FastAPI 422 strips input for Stage 3B request models
+    app = FastAPI()
+    register_exception_handlers(app)
+
+    @app.post("/_stage3b/reset")
+    def _reset(body: ResetPasswordRequest):
+        return {"ok": True}
+
+    @app.post("/_stage3b/change")
+    def _change(body: ChangePasswordRequest):
+        return {"ok": True}
+
+    client = TestClient(app)
+    r1 = client.post("/_stage3b/reset", json={"token": "", "new_password": "SecretValue!999"})
+    assert r1.status_code == 422
+    assert "SecretValue!999" not in r1.text
+    for err in r1.json()["error"]["details"]["errors"]:
+        assert "input" not in err
+
+    r2 = client.post("/_stage3b/change", json={"current_password": "", "new_password": "SecretValue!888"})
+    assert r2.status_code == 422
+    assert "SecretValue!888" not in r2.text
+    for err in r2.json()["error"]["details"]["errors"]:
+        assert "input" not in err

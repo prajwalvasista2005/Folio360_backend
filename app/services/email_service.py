@@ -1,4 +1,4 @@
-"""Resend transactional email integration and verification URL builder (Stage 3A)."""
+"""Resend transactional email integration and verification/reset URL builders (Stage 3A/3B)."""
 
 from dataclasses import dataclass
 from functools import lru_cache
@@ -93,6 +93,67 @@ def send_verification_email(
     except Exception as exc:
         logger.warning(
             "Resend verification email delivery failed: exception=%s",
+            type(exc).__name__,
+        )
+        return EmailSendResult(sent=False, error_type=type(exc).__name__)
+
+
+def build_password_reset_url(frontend_base_url: str, raw_token: str) -> str:
+    """Build {FRONTEND_BASE_URL}/reset-password?token=<raw> strictly from FRONTEND_BASE_URL."""
+    base = frontend_base_url.rstrip("/")
+    query = urlencode({"token": raw_token})
+    return f"{base}/reset-password?{query}"
+
+
+def send_password_reset_email(
+    *,
+    to_email: str,
+    raw_token: str,
+    settings: Settings,
+) -> EmailSendResult:
+    """Send password reset email via Resend without logging raw tokens, secrets, or emails."""
+    api_key = settings.RESEND_API_KEY.get_secret_value().strip() if settings.RESEND_API_KEY else ""
+    if not api_key:
+        logger.warning(
+            "Resend password reset delivery skipped: RESEND_API_KEY is not configured; status=failed"
+        )
+        return EmailSendResult(sent=False, error_type="ResendNotConfigured")
+
+    reset_url = build_password_reset_url(settings.FRONTEND_BASE_URL, raw_token)
+    safe_reset_url = escape(reset_url, quote=True)
+    expire_minutes = settings.PASSWORD_RESET_EXPIRE_MINUTES
+    params: dict[str, object] = {
+        "from": settings.EMAIL_FROM_ADDRESS,
+        "to": [to_email],
+        "subject": "Reset your Folio360 password",
+        "html": (
+            "<p>We received a request to reset your Folio360 password.</p>"
+            f'<p><a href="{safe_reset_url}">Reset your password</a></p>'
+            f"<p>This link expires in {expire_minutes} minutes and can only be used once.</p>"
+            "<p>If you did not request a password reset, you can safely ignore this email.</p>"
+        ),
+        "text": (
+            "We received a request to reset your Folio360 password.\n\n"
+            f"Reset your password: {reset_url}\n\n"
+            f"This link expires in {expire_minutes} minutes and can only be used once.\n"
+            "If you did not request a password reset, you can safely ignore this email."
+        ),
+    }
+    try:
+        resend.api_key = api_key
+        resend.default_http_client = get_resend_http_client(
+            float(settings.EMAIL_SEND_TIMEOUT_SECONDS)
+        )
+        response = resend.Emails.send(params)
+        message_id = response.get("id") if isinstance(response, dict) else None
+        logger.info("Resend password reset email accepted: message_id=%s", message_id or "none")
+        return EmailSendResult(
+            sent=True,
+            provider_message_id=str(message_id) if message_id else None,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Resend password reset email delivery failed: exception=%s",
             type(exc).__name__,
         )
         return EmailSendResult(sent=False, error_type=type(exc).__name__)

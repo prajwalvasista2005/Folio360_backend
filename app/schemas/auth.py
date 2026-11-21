@@ -1,4 +1,4 @@
-"""Pydantic v2 request and response schemas for Stage 3A authentication endpoints."""
+"""Pydantic v2 request and response schemas for Stage 3A/3B authentication endpoints."""
 
 from datetime import datetime
 from typing import Any, Literal
@@ -175,3 +175,73 @@ class LogoutResponse(BaseModel):
     """Response payload for POST /logout and POST /logout-all."""
 
     message: str
+
+
+def _strip_nonempty_token(value: Any, field_label: str) -> str:
+    """Validate and strip an opaque string token without echoing it on failure."""
+    if not isinstance(value, str):
+        raise ValueError(f"{field_label} must be a string")
+    cleaned = value.strip()
+    if not cleaned:
+        raise ValueError(f"{field_label} must not be empty")
+    return cleaned
+
+
+class ForgotPasswordRequest(BaseModel):
+    """Request payload for POST /api/v1/auth/forgot-password."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: EmailStr
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def sanitize_email_before(cls, value: Any) -> Any:
+        return _preprocess_email(value)
+
+    @field_validator("email", mode="after")
+    @classmethod
+    def lowercase_email(cls, value: EmailStr) -> str:
+        return normalize_email(str(value))
+
+
+class ResetPasswordRequest(BaseModel):
+    """Request payload for POST /api/v1/auth/reset-password."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    token: str = Field(min_length=1, max_length=512)
+    new_password: str = Field(min_length=1, max_length=128)
+
+    @field_validator("token", mode="before")
+    @classmethod
+    def strip_token(cls, value: Any) -> str:
+        return _strip_nonempty_token(value, "Password reset token")
+
+
+class ResetPasswordResponse(BaseModel):
+    """Response payload for POST /api/v1/auth/reset-password (no tokens minted)."""
+
+    message: str
+
+
+class ChangePasswordRequest(BaseModel):
+    """Request payload for POST /api/v1/auth/change-password."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    current_password: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=1, max_length=128)
+
+
+class WebPasswordChangeResponse(WebAuthTokenResponse):
+    """Access token + user + message for X-Client-Type: web (refresh token in HttpOnly cookie)."""
+
+    message: str = "Password updated successfully."
+
+
+class MobilePasswordChangeResponse(WebPasswordChangeResponse):
+    """Access + refresh token JSON + message for X-Client-Type: mobile (zero cookies)."""
+
+    refresh_token: str
+    refresh_expires_in: int

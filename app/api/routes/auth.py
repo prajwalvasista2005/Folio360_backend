@@ -1,4 +1,4 @@
-"""Stage 3A synchronous authentication routes under /api/v1/auth/*."""
+"""Stage 3A/3B synchronous authentication routes under /api/v1/auth/*."""
 
 from typing import Optional
 
@@ -22,20 +22,26 @@ from app.core.exceptions import AppException
 from app.db.session import get_db
 from app.models.user import User
 from app.schemas.auth import (
+    ChangePasswordRequest,
+    ForgotPasswordRequest,
     GenericAcceptedResponse,
     LoginRequest,
     LogoutRequest,
     LogoutResponse,
     MeResponse,
     MobileAuthTokenResponse,
+    MobilePasswordChangeResponse,
     RefreshRequest,
     RegisterRequest,
     RegisterResponse,
     ResendVerificationRequest,
+    ResetPasswordRequest,
+    ResetPasswordResponse,
     UserPublicResponse,
     VerifyEmailRequest,
     VerifyEmailResponse,
     WebAuthTokenResponse,
+    WebPasswordChangeResponse,
 )
 from app.services import auth_service
 
@@ -368,4 +374,113 @@ def get_me(
         has_password=current_user.password_hash is not None,
         created_at=current_user.created_at,
         updated_at=current_user.updated_at,
+    )
+
+
+@router.post(
+    "/forgot-password",
+    response_model=GenericAcceptedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[
+        Depends(rate_limit_dependency("auth:forgot-password", limit=5, window_seconds=900))
+    ],
+    summary="Request a password reset email",
+)
+def forgot_password(
+    request: Request,
+    payload: ForgotPasswordRequest,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_current_settings),
+) -> GenericAcceptedResponse:
+    """Always return generic 202 Accepted while enforcing Rev10 §11.2 cooldowns/retries."""
+    auth_service.request_password_reset(
+        db,
+        email=str(payload.email),
+        requested_ip=resolve_client_ip(request),
+        settings=settings,
+    )
+    return GenericAcceptedResponse(
+        message="If an eligible verified account exists for this email, a password reset link has been sent."
+    )
+
+
+@router.post(
+    "/reset-password",
+    response_model=ResetPasswordResponse,
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(rate_limit_dependency("auth:reset-password", limit=10, window_seconds=900))
+    ],
+    summary="Reset password using a single-use reset token",
+)
+def reset_password(
+    payload: ResetPasswordRequest,
+    db: Session = Depends(get_db),
+) -> ResetPasswordResponse:
+    """Consume a single-use password reset token, revoke all sessions, and return zero tokens."""
+    auth_service.reset_password(
+        db,
+        raw_token=payload.token,
+        new_password=payload.new_password,
+    )
+    return ResetPasswordResponse(
+        message="Password has been reset successfully. Please sign in with your new password."
+    )
+
+
+@router.post(
+    "/change-password",
+    response_model=MobilePasswordChangeResponse | WebPasswordChangeResponse,
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(rate_limit_dependency("auth:change-password", limit=30, window_seconds=900))
+    ],
+    summary="Change password for the authenticated user",
+)
+def change_password(
+    request: Request,
+    response: Response,
+    payload: ChangePasswordRequest,
+    auth_ctx: AuthenticatedUser = Depends(get_current_auth_context),
+    client_type: ClientType = Depends(require_client_type),
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_current_settings),
+) -> WebPasswordChangeResponse | MobilePasswordChangeResponse:
+    """Rotate password, revoke prior sessions/reset tokens, and issue one fresh session."""
+    enforce_web_origin_if_web(request, client_type, settings)
+
+    user, access_token, expires_in, raw_refresh, refresh_expires_in = (
+        auth_service.change_password(
+            db,
+            user_id=auth_ctx.user.id,
+            expected_auth_version=auth_ctx.token_ver,
+            current_password=payload.current_password,
+            new_password=payload.new_password,
+            client_type=client_type,
+            user_agent=request.headers.get("user-agent"),
+            ip_address=resolve_client_ip(request),
+            settings=settings,
+        )
+    )
+    user_public = _to_user_public(user)
+
+    if client_type == "web":
+        _set_refresh_cookie(
+            response,
+            raw_refresh_token=raw_refresh,
+            max_age_seconds=refresh_expires_in,
+            settings=settings,
+        )
+        return WebPasswordChangeResponse(
+            access_token=access_token,
+            expires_in=expires_in,
+            user=user_public,
+        )
+
+    return MobilePasswordChangeResponse(
+        access_token=access_token,
+        expires_in=expires_in,
+        refresh_token=raw_refresh,
+        refresh_expires_in=refresh_expires_in,
+        user=user_public,
     )
