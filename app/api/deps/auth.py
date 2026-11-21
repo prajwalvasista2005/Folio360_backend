@@ -1,5 +1,6 @@
 """Stage 3A authentication, CSRF/Origin, client-IP, and rate-limiting dependencies."""
 
+from dataclasses import dataclass
 import ipaddress
 import logging
 from typing import Callable, Literal
@@ -173,11 +174,19 @@ def _extract_bearer_token(request: Request) -> str:
     return token
 
 
-def get_current_user(
+@dataclass(frozen=True)
+class AuthenticatedUser:
+    """Authenticated user paired with the original decoded JWT auth_version claim."""
+
+    user: User
+    token_ver: int
+
+
+def get_current_auth_context(
     request: Request,
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_current_settings),
-) -> User:
+) -> AuthenticatedUser:
     """Authenticate Bearer Access JWT, enforce auth_version and active account status."""
     token = _extract_bearer_token(request)
     try:
@@ -206,4 +215,11 @@ def get_current_user(
             public_message="Account is inactive.",
         )
 
-    return user
+    return AuthenticatedUser(user=user, token_ver=token_ver)
+
+
+def get_current_user(
+    auth_ctx: AuthenticatedUser = Depends(get_current_auth_context),
+) -> User:
+    """Return the authenticated User resolved by get_current_auth_context."""
+    return auth_ctx.user

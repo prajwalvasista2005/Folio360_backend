@@ -1,16 +1,25 @@
 """Unit tests for Stage 3A security primitives, config, 422 stripping, logging, and rate limiting."""
 
+from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 import uuid
 
-from fastapi import Body, FastAPI, Request
+from fastapi import Body, Depends, FastAPI, Request
 from fastapi.testclient import TestClient
 import jwt
 from pydantic import BaseModel, ValidationError
 import pytest
 
-from app.api.deps.auth import resolve_client_ip
+from app.api.deps.auth import (
+    AuthenticatedUser,
+    get_current_auth_context,
+    get_current_settings,
+    get_current_user,
+    resolve_client_ip,
+)
+from app.db.session import get_db
+from app.models.user import User
 from app.core.config import Settings
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import REDACTED, sanitize_log_text
@@ -412,3 +421,98 @@ def test_resend_http_client_cached_by_timeout(monkeypatch: pytest.MonkeyPatch) -
     )
     assert res3.sent is True
     assert seen_clients[2] is not seen_clients[0]
+
+
+def test_authenticated_user_context_immutability_and_single_query_delegation() -> None:
+    uid = uuid.uuid4()
+    sample_user = User(
+        id=uid,
+        email="ctx.user@example.com",
+        is_active=True,
+        is_email_verified=True,
+        auth_version=2,
+    )
+    auth_ctx = AuthenticatedUser(user=sample_user, token_ver=2)
+    with pytest.raises(FrozenInstanceError):
+        auth_ctx.token_ver = 3  # type: ignore[misc]
+
+    settings = _dev_jwt_settings()
+
+    class _FakeScalarResult:
+        def __init__(self, row: User | None) -> None:
+            self._row = row
+
+        def scalar_one_or_none(self) -> User | None:
+            return self._row
+
+    class _FakeDB:
+        def __init__(self) -> None:
+            self.execute_calls = 0
+            self.user_to_return: User | None = sample_user
+
+        def execute(self, _stmt):
+            self.execute_calls += 1
+            return _FakeScalarResult(self.user_to_return)
+
+    fake_db = _FakeDB()
+    app = FastAPI()
+    register_exception_handlers(app)
+    app.dependency_overrides[get_current_settings] = lambda: settings
+    app.dependency_overrides[get_db] = lambda: fake_db
+
+    observed: dict[str, object] = {}
+
+    @app.get("/_auth-ctx")
+    def _auth_ctx_route(
+        ctx: AuthenticatedUser = Depends(get_current_auth_context),
+        user: User = Depends(get_current_user),
+    ) -> dict[str, object]:
+        observed["same_instance"] = ctx.user is user
+        observed["token_ver"] = ctx.token_ver
+        return {"id": str(user.id), "token_ver": ctx.token_ver}
+
+    @app.get("/_auth-user-only")
+    def _auth_user_only_route(
+        user: User = Depends(get_current_user),
+    ) -> dict[str, str]:
+        return {"id": str(user.id)}
+
+    valid_jwt, _ = create_access_token(user_id=uid, auth_version=2, settings=settings)
+    stale_jwt, _ = create_access_token(user_id=uid, auth_version=1, settings=settings)
+
+    with TestClient(app) as client:
+        # Both dependencies in one request perform a single DB lookup
+        ok_resp = client.get(
+            "/_auth-ctx",
+            headers={"Authorization": f"Bearer {valid_jwt}"},
+        )
+        assert ok_resp.status_code == 200
+        assert ok_resp.json() == {"id": str(uid), "token_ver": 2}
+        assert observed == {"same_instance": True, "token_ver": 2}
+        assert fake_db.execute_calls == 1
+
+        # get_current_user standalone compatibility
+        user_only_resp = client.get(
+            "/_auth-user-only",
+            headers={"Authorization": f"Bearer {valid_jwt}"},
+        )
+        assert user_only_resp.status_code == 200
+        assert user_only_resp.json() == {"id": str(uid)}
+
+        # Mismatched JWT auth_version returns 401 INVALID_ACCESS_TOKEN + WWW-Authenticate
+        stale_resp = client.get(
+            "/_auth-ctx",
+            headers={"Authorization": f"Bearer {stale_jwt}"},
+        )
+        assert stale_resp.status_code == 401
+        assert stale_resp.headers.get("www-authenticate") == "Bearer"
+        assert stale_resp.json()["error"]["details"]["code"] == "INVALID_ACCESS_TOKEN"
+
+        # Inactive user returns 403 ACCOUNT_INACTIVE
+        sample_user.is_active = False
+        inactive_resp = client.get(
+            "/_auth-ctx",
+            headers={"Authorization": f"Bearer {valid_jwt}"},
+        )
+        assert inactive_resp.status_code == 403
+        assert inactive_resp.json()["error"]["details"]["code"] == "ACCOUNT_INACTIVE"

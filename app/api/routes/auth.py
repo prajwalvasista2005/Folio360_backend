@@ -6,8 +6,10 @@ from fastapi import APIRouter, Body, Depends, Request, Response, status
 from sqlalchemy.orm import Session
 
 from app.api.deps.auth import (
+    AuthenticatedUser,
     ClientType,
     enforce_web_origin_if_web,
+    get_current_auth_context,
     get_current_settings,
     get_current_user,
     optional_client_type,
@@ -327,7 +329,7 @@ def logout(
 def logout_all(
     request: Request,
     response: Response,
-    current_user: User = Depends(get_current_user),
+    auth_ctx: AuthenticatedUser = Depends(get_current_auth_context),
     client_type: ClientType | None = Depends(optional_client_type),
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_current_settings),
@@ -336,7 +338,11 @@ def logout_all(
     if client_type == "web":
         enforce_web_origin_if_web(request, "web", settings)
 
-    auth_service.logout_all_sessions(db, user_id=current_user.id)
+    auth_service.logout_all_sessions(
+        db,
+        user_id=auth_ctx.user.id,
+        expected_auth_version=auth_ctx.token_ver,
+    )
 
     if client_type == "web":
         _clear_refresh_cookie(response, settings=settings)

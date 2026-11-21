@@ -139,7 +139,10 @@ def verify_email(
 
     # Lock users first, then the token row
     user = db.execute(
-        select(User).where(User.id == token_user_id).with_for_update()
+        select(User)
+        .where(User.id == token_user_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     ).scalar_one_or_none()
     if user is None:
         db.rollback()
@@ -164,6 +167,7 @@ def verify_email(
             EmailVerificationToken.user_id == user.id,
         )
         .with_for_update()
+        .execution_options(populate_existing=True)
     ).scalar_one_or_none()
 
     now = datetime.now(timezone.utc)
@@ -220,7 +224,10 @@ def resend_verification(
 
     # Tx 1: serialized under users FOR UPDATE lock
     user = db.execute(
-        select(User).where(User.id == user_id).with_for_update()
+        select(User)
+        .where(User.id == user_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     ).scalar_one_or_none()
     if user is None or not user.is_active or user.is_email_verified:
         db.rollback()
@@ -452,10 +459,11 @@ def refresh_session_token(
     settings: Settings,
 ) -> tuple[User, str, int, str, int]:
     """
-    Rotate a single-use opaque refresh token under FOR UPDATE row locking.
+    Rotate a single-use opaque refresh token under users-first FOR UPDATE locking.
 
-    Replaying an already-rotated token revokes only the affected family_id and
-    raises 401 REFRESH_TOKEN_REUSE_DETECTED.
+    Locks users first, then refresh_sessions (deadlock-free hierarchy). Replaying an
+    already-rotated token revokes only the affected family_id and raises
+    401 REFRESH_TOKEN_REUSE_DETECTED.
     """
     if not raw_refresh_token or not raw_refresh_token.strip():
         raise auth_error(
@@ -465,10 +473,40 @@ def refresh_session_token(
         )
 
     token_hash = hash_opaque_token(raw_refresh_token.strip())
+    session_user_id = db.execute(
+        select(RefreshSession.user_id).where(RefreshSession.token_hash == token_hash)
+    ).scalar_one_or_none()
+
+    if session_user_id is None:
+        raise auth_error(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            code="INVALID_REFRESH_TOKEN",
+            public_message="Invalid or expired refresh token.",
+        )
+
+    # Lock users first, then refresh_sessions, refreshing ORM identity-map state
+    user = db.execute(
+        select(User)
+        .where(User.id == session_user_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
+    if user is None:
+        db.rollback()
+        raise auth_error(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            code="INVALID_REFRESH_TOKEN",
+            public_message="Invalid or expired refresh token.",
+        )
+
     session_row = db.execute(
         select(RefreshSession)
-        .where(RefreshSession.token_hash == token_hash)
+        .where(
+            RefreshSession.token_hash == token_hash,
+            RefreshSession.user_id == user.id,
+        )
         .with_for_update()
+        .execution_options(populate_existing=True)
     ).scalar_one_or_none()
 
     if session_row is None:
@@ -520,17 +558,6 @@ def refresh_session_token(
         session_row.revoked_at = now
         session_row.revoke_reason = "expired"
         db.commit()
-        raise auth_error(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            code="INVALID_REFRESH_TOKEN",
-            public_message="Invalid or expired refresh token.",
-        )
-
-    user = db.execute(
-        select(User).where(User.id == session_row.user_id)
-    ).scalar_one_or_none()
-    if user is None:
-        db.rollback()
         raise auth_error(
             status_code=status.HTTP_401_UNAUTHORIZED,
             code="INVALID_REFRESH_TOKEN",
@@ -599,15 +626,32 @@ def logout_current_session(
     raw_refresh_token: str | None,
     client_type: str,
 ) -> None:
-    """Idempotently revoke the active refresh session matching raw_refresh_token and client_type."""
+    """Idempotently revoke the active refresh session using users-first locking."""
     if not raw_refresh_token or not raw_refresh_token.strip():
         return
 
     token_hash = hash_opaque_token(raw_refresh_token.strip())
+    session_user_id = db.execute(
+        select(RefreshSession.user_id).where(RefreshSession.token_hash == token_hash)
+    ).scalar_one_or_none()
+    if session_user_id is None:
+        return
+
+    locked_user_id = db.execute(
+        select(User.id).where(User.id == session_user_id).with_for_update()
+    ).scalar_one_or_none()
+    if locked_user_id is None:
+        db.rollback()
+        return
+
     session_row = db.execute(
         select(RefreshSession)
-        .where(RefreshSession.token_hash == token_hash)
+        .where(
+            RefreshSession.token_hash == token_hash,
+            RefreshSession.user_id == locked_user_id,
+        )
         .with_for_update()
+        .execution_options(populate_existing=True)
     ).scalar_one_or_none()
 
     if (
@@ -626,18 +670,48 @@ def logout_all_sessions(
     db: Session,
     *,
     user_id: uuid.UUID,
+    expected_auth_version: int | None = None,
 ) -> None:
     """
     Atomically increment users.auth_version and revoke all active refresh sessions.
 
-    Locks users row first before updating refresh_sessions.
+    Locks and refreshes the users row first, revalidates is_active unconditionally
+    (and expected_auth_version when supplied) under the row lock, and only then
+    updates users and refresh_sessions.
     """
     user = db.execute(
-        select(User).where(User.id == user_id).with_for_update()
+        select(User)
+        .where(User.id == user_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     ).scalar_one_or_none()
     if user is None:
         db.rollback()
+        if expected_auth_version is not None:
+            raise auth_error(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                code="INVALID_ACCESS_TOKEN",
+                public_message="Invalid or expired access token.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         return
+
+    if expected_auth_version is not None and user.auth_version != expected_auth_version:
+        db.rollback()
+        raise auth_error(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            code="INVALID_ACCESS_TOKEN",
+            public_message="Invalid or expired access token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if not user.is_active:
+        db.rollback()
+        raise auth_error(
+            status_code=status.HTTP_403_FORBIDDEN,
+            code="ACCOUNT_INACTIVE",
+            public_message="Account is inactive.",
+        )
 
     now = datetime.now(timezone.utc)
     user.auth_version += 1
