@@ -2,6 +2,7 @@
 
 from app.db.base import Base
 from app.models.email_verification_token import EmailVerificationToken
+from app.models.oauth import OAuthAccount, OAuthExchangeCode, OAuthState
 from app.models.password_reset_token import PasswordResetToken
 from app.models.refresh_session import RefreshSession
 from app.models.user import User
@@ -12,4 +13,7 @@ __all__ = [
     "EmailVerificationToken",
     "PasswordResetToken",
     "RefreshSession",
+    "OAuthAccount",
+    "OAuthState",
+    "OAuthExchangeCode",
 ]

@@ -12,11 +12,13 @@ from sqlalchemy import Engine
 from starlette.types import Receive, Scope, Send
 import uvicorn.config
 
-from app.api.routes import auth, health
+from app.api.routes import auth, health, oauth
 from app.core.config import Settings, get_settings
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import setup_logging
+from app.core.oauth_middleware import OAuthSecurityResponseMiddleware
 from app.core.rate_limit import SlidingWindowRateLimiter
+from app.services.oauth_providers import build_google_jwk_client
 from app.db.session import (
     build_engine,
     build_readiness_engine,
@@ -83,7 +85,14 @@ def _reset_db_state(app: FastAPI) -> None:
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan context manager with exception-safe database resource cleanup."""
     settings: Settings = getattr(app.state, "settings", None) or get_settings()
-    setup_logging(log_level=settings.LOG_LEVEL)
+    setup_logging(
+        log_level=settings.LOG_LEVEL,
+        extra_sensitive_keys=(
+            settings.OAUTH_BINDING_COOKIE_NAME,
+            settings.OAUTH_EXCHANGE_COOKIE_NAME,
+            settings.REFRESH_COOKIE_NAME,
+        ),
+    )
     _reset_db_state(app)
 
     db_engine: Engine | None = None
@@ -164,13 +173,20 @@ def create_app(settings: Settings | None = None) -> Folio360FastAPI:
         lifespan=lifespan,
     )
 
-    # Attach settings instance and runtime rate limiter without DB side effects
+    # Attach settings instance, rate limiter, and JWKS client without startup network/DB side effects
     application.state.settings = settings
     application.state.rate_limiter = SlidingWindowRateLimiter()
+    application.state.google_jwk_client = build_google_jwk_client(settings)
     _reset_db_state(application)
 
     # Centralized exception handling
     register_exception_handlers(application)
+
+    # OAuth security middleware registered inside CORSMiddleware (Starlette applies last-added outermost)
+    application.add_middleware(
+        OAuthSecurityResponseMiddleware,
+        settings=settings,
+    )
 
     # CORS configuration
     if settings.CORS_ORIGINS:
@@ -186,6 +202,7 @@ def create_app(settings: Settings | None = None) -> Folio360FastAPI:
     api_v1_router = APIRouter(prefix=settings.API_V1_PREFIX)
     api_v1_router.include_router(health.router)
     api_v1_router.include_router(auth.router)
+    api_v1_router.include_router(oauth.router)
     application.include_router(api_v1_router)
 
     return application

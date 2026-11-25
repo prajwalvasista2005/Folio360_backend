@@ -36,11 +36,14 @@ from app.services.email_service import (
 logger = logging.getLogger("folio360.auth.service")
 
 
-def _get_constraint_name(exc: IntegrityError) -> str | None:
+def get_constraint_name(exc: IntegrityError) -> str | None:
     """Extract only the PostgreSQL constraint_name without exposing DETAIL values."""
     orig = getattr(exc, "orig", None)
     diag = getattr(orig, "diag", None)
     return getattr(diag, "constraint_name", None)
+
+
+_get_constraint_name = get_constraint_name
 
 
 def register_user(
@@ -231,7 +234,7 @@ def _validate_new_password_or_raise(new_password: str, email: str) -> None:
         ) from exc
 
 
-def _create_session_and_mint_tokens(
+def create_session_and_mint_tokens(
     db: Session,
     *,
     user: User,
@@ -240,8 +243,9 @@ def _create_session_and_mint_tokens(
     ip_address: str | None,
     now: datetime,
     settings: Settings,
+    commit: bool = True,
 ) -> tuple[User, str, int, str, int]:
-    """Create a fresh root RefreshSession, commit transaction, then mint an access JWT."""
+    """Create a fresh root RefreshSession (committing unless commit=False) and mint an access JWT."""
     raw_refresh_token = generate_opaque_token()
     refresh_hash = hash_opaque_token(raw_refresh_token)
     rolling_ttl = timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
@@ -266,7 +270,10 @@ def _create_session_and_mint_tokens(
     db.add(session_row)
     user_id = user.id
     auth_version = user.auth_version
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
 
     access_token, expires_in = create_access_token(
         user_id=user_id,
@@ -276,6 +283,9 @@ def _create_session_and_mint_tokens(
     )
     refresh_expires_in = max(1, int((expires_at - now).total_seconds()))
     return user, access_token, expires_in, raw_refresh_token, refresh_expires_in
+
+
+_create_session_and_mint_tokens = create_session_and_mint_tokens
 
 
 def _normalize_persisted_ip(ip_address: str | None) -> str | None:

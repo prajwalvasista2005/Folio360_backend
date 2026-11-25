@@ -4,6 +4,7 @@ from email.utils import parseaddr
 from functools import lru_cache
 import ipaddress
 import json
+import re
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
@@ -12,7 +13,20 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 
-from app.core.uri_policy import canonicalize_mobile_login_allowlist
+from app.core.crypto_keys import decode_aes256_base64url_key
+from app.core.uri_policy import (
+    MALFORMED_PERCENT_RE,
+    OAUTH_FORBIDDEN_ENCODED_RE,
+    canonicalize_mobile_login_allowlist,
+    canonicalize_mobile_oauth_redirect_allowlist,
+    canonicalize_web_oauth_redirect_allowlist,
+    parse_and_canonicalize_web_oauth_redirect_uri,
+    validate_strict_authority,
+)
+
+OAUTH_EXCHANGE_CODE_EXPIRE_SECONDS = 60
+DEFAULT_MOBILE_OAUTH_REDIRECT_URI = "folio360://auth/callback"
+RFC6265_COOKIE_NAME_RE = re.compile(r"\A[!#$%&'*+\-.^_`|~0-9A-Za-z]+\Z")
 
 
 def _validate_postgres_psycopg_url(
@@ -217,6 +231,29 @@ class Settings(BaseSettings):
     PROXY_HEADERS_ENABLED: bool = False
     TRUSTED_PROXY_IPS: list[str] = []
 
+    # Stage 3C: OAuth 2.0 / OIDC Configuration (F360-S3C-SPEC-REV12)
+    BACKEND_BASE_URL: str = "http://localhost:8000"
+    OAUTH_BINDING_COOKIE_NAME: str = "folio360_oauth_binding"
+    OAUTH_EXCHANGE_COOKIE_NAME: str = "folio360_oauth_exchange"
+    OAUTH_PKCE_ENCRYPTION_KEY: SecretStr | None = None
+    OAUTH_PKCE_ENCRYPTION_KEY_PREVIOUS: SecretStr | None = None
+    GOOGLE_CLIENT_ID: str | None = None
+    GOOGLE_CLIENT_SECRET: SecretStr | None = None
+    GOOGLE_TRUSTED_ADDITIONAL_AUDIENCES: list[str] = []
+    GITHUB_CLIENT_ID: str | None = None
+    GITHUB_CLIENT_SECRET: SecretStr | None = None
+    OAUTH_ALLOWED_WEB_REDIRECT_URIS: list[str] = []
+    OAUTH_ALLOWED_MOBILE_REDIRECT_URIS: list[str] = [DEFAULT_MOBILE_OAUTH_REDIRECT_URI]
+    OAUTH_STATE_EXPIRE_MINUTES: int = Field(default=10, ge=1, le=30)
+    OAUTH_HTTP_TIMEOUT_SECONDS: float = Field(default=5.0, ge=1.0, le=15.0)
+    GITHUB_EMAILS_PER_PAGE: int = Field(default=100, ge=1, le=100)
+    GITHUB_EMAILS_MAX_PAGES: int = Field(default=10, ge=1, le=20)
+
+    @property
+    def oauth_enabled(self) -> bool:
+        """Return True when at least one OAuth provider is configured."""
+        return bool(self.GOOGLE_CLIENT_ID) or bool(self.GITHUB_CLIENT_ID)
+
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
     def assemble_cors_origins(cls, value: Any) -> list[str]:
@@ -385,6 +422,168 @@ class Settings(BaseSettings):
             allow_empty_string=True,
         )
 
+    @field_validator("GOOGLE_CLIENT_ID", "GITHUB_CLIENT_ID", mode="before")
+    @classmethod
+    def normalize_optional_provider_client_id(cls, value: Any) -> str | None:
+        """Normalize empty or whitespace-only OAuth client IDs to None."""
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("OAuth client ID must be a string or None")
+        stripped = value.strip()
+        return stripped or None
+
+    @field_validator(
+        "GOOGLE_CLIENT_SECRET",
+        "GITHUB_CLIENT_SECRET",
+        "OAUTH_PKCE_ENCRYPTION_KEY",
+        "OAUTH_PKCE_ENCRYPTION_KEY_PREVIOUS",
+        mode="before",
+    )
+    @classmethod
+    def normalize_optional_oauth_secret(cls, value: Any) -> SecretStr | None:
+        """Normalize blank OAuth secrets to None without echoing secret values."""
+        if value is None:
+            return None
+        if isinstance(value, SecretStr):
+            raw = value.get_secret_value()
+        elif isinstance(value, str):
+            raw = value
+        else:
+            raise ValueError("OAuth secret must be a string or None")
+        if not raw.strip():
+            return None
+        return SecretStr(raw)
+
+    @field_validator("API_V1_PREFIX")
+    @classmethod
+    def validate_api_v1_prefix(cls, value: str) -> str:
+        """Normalize API_V1_PREFIX consistently with FastAPI APIRouter and OAuth callbacks."""
+        return normalize_api_v1_prefix(value)
+
+    @field_validator("GOOGLE_TRUSTED_ADDITIONAL_AUDIENCES", mode="before")
+    @classmethod
+    def parse_google_trusted_additional_audiences(cls, value: Any) -> list[str]:
+        """Parse GOOGLE_TRUSTED_ADDITIONAL_AUDIENCES and reject wildcards, spaces, or duplicates."""
+        entries = _parse_string_list_setting(
+            value,
+            field_name="GOOGLE_TRUSTED_ADDITIONAL_AUDIENCES",
+            allow_empty_string=True,
+        )
+        seen: set[str] = set()
+        for entry in entries:
+            if "*" in entry:
+                raise ValueError(
+                    "GOOGLE_TRUSTED_ADDITIONAL_AUDIENCES must not contain wildcards ('*')"
+                )
+            if any(ch.isspace() for ch in entry):
+                raise ValueError(
+                    "GOOGLE_TRUSTED_ADDITIONAL_AUDIENCES entries must not contain whitespace"
+                )
+            if entry in seen:
+                raise ValueError(
+                    "Duplicate entry detected in GOOGLE_TRUSTED_ADDITIONAL_AUDIENCES"
+                )
+            seen.add(entry)
+        return entries
+
+    @field_validator("OAUTH_ALLOWED_WEB_REDIRECT_URIS", mode="before")
+    @classmethod
+    def parse_oauth_allowed_web_redirect_uris(cls, value: Any) -> list[str]:
+        """Parse OAUTH_ALLOWED_WEB_REDIRECT_URIS from list, JSON array, or CSV."""
+        return _parse_string_list_setting(
+            value,
+            field_name="OAUTH_ALLOWED_WEB_REDIRECT_URIS",
+            allow_empty_string=True,
+        )
+
+    @field_validator("OAUTH_ALLOWED_MOBILE_REDIRECT_URIS", mode="before")
+    @classmethod
+    def parse_oauth_allowed_mobile_redirect_uris(cls, value: Any) -> list[str]:
+        """Parse OAUTH_ALLOWED_MOBILE_REDIRECT_URIS from list, JSON array, or CSV."""
+        return _parse_string_list_setting(
+            value,
+            field_name="OAUTH_ALLOWED_MOBILE_REDIRECT_URIS",
+            allow_empty_string=True,
+        )
+
+    @field_validator("OAUTH_BINDING_COOKIE_NAME", "OAUTH_EXCHANGE_COOKIE_NAME")
+    @classmethod
+    def validate_oauth_cookie_names(cls, value: str) -> str:
+        """Ensure OAuth cookie names are non-empty valid RFC 6265 HTTP token strings."""
+        if not isinstance(value, str) or not RFC6265_COOKIE_NAME_RE.fullmatch(value):
+            raise ValueError(
+                "OAuth cookie name must be a non-empty valid RFC 6265 token"
+            )
+        return value
+
+    @field_validator("BACKEND_BASE_URL")
+    @classmethod
+    def validate_backend_base_url(cls, value: str) -> str:
+        """Validate BACKEND_BASE_URL as an exact scheme://host[:port] base URL."""
+        if not isinstance(value, str):
+            raise ValueError("BACKEND_BASE_URL must be a string")
+        if not value or any(ch.isspace() for ch in value) or not value.isascii():
+            raise ValueError("BACKEND_BASE_URL must be a non-empty ASCII URL without whitespace")
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+            raise ValueError("BACKEND_BASE_URL must not contain control characters")
+        for forbidden_char in ("\\", "*", "@", "?", "#"):
+            if forbidden_char in value:
+                raise ValueError(
+                    f"BACKEND_BASE_URL contains forbidden character {forbidden_char!r}"
+                )
+        if value.endswith("/"):
+            raise ValueError("BACKEND_BASE_URL must not end with a trailing '/'")
+        if "://" not in value:
+            raise ValueError("BACKEND_BASE_URL must contain '://' scheme-authority separator")
+
+        raw_scheme, rest = value.split("://", 1)
+        scheme_lower = raw_scheme.lower()
+        if not rest:
+            raise ValueError("BACKEND_BASE_URL must include a non-empty authority")
+        if "/" in rest:
+            raise ValueError("BACKEND_BASE_URL must not contain a path")
+        if "%" in rest:
+            raise ValueError("BACKEND_BASE_URL authority must not contain percent-encoded sequences")
+        if rest.endswith(":"):
+            raise ValueError("BACKEND_BASE_URL authority must not end with an empty port ':'")
+
+        validate_strict_authority(rest, scheme_lower=scheme_lower)
+
+        try:
+            parts = urlsplit(value)
+            port = parts.port
+        except ValueError as exc:
+            raise ValueError(f"Malformed BACKEND_BASE_URL: {exc}") from exc
+
+        scheme = parts.scheme.lower()
+        if scheme not in {"http", "https"}:
+            raise ValueError("BACKEND_BASE_URL must use http:// or https://")
+        if not parts.hostname:
+            raise ValueError("BACKEND_BASE_URL must include a non-empty host")
+        if parts.username is not None or parts.password is not None:
+            raise ValueError("BACKEND_BASE_URL must not contain credentials")
+        if parts.path != "":
+            raise ValueError("BACKEND_BASE_URL must not contain a path")
+        if parts.query or parts.fragment:
+            raise ValueError("BACKEND_BASE_URL must not contain query parameters or fragments")
+        if scheme == "https" and port == 443:
+            raise ValueError("BACKEND_BASE_URL must not specify redundant default port :443")
+        if scheme == "http" and port == 80:
+            raise ValueError("BACKEND_BASE_URL must not specify redundant default port :80")
+        if scheme == "http":
+            host_lower = parts.hostname.lower()
+            if ":" in host_lower:
+                normalized_host = f"[{ipaddress.IPv6Address(host_lower).compressed}]"
+            else:
+                normalized_host = host_lower
+            if normalized_host not in {"localhost", "127.0.0.1", "[::1]"}:
+                raise ValueError(
+                    "http:// BACKEND_BASE_URL is permitted only for loopback hosts "
+                    "(localhost, 127.0.0.1, [::1])"
+                )
+        return value
+
     @field_validator("LOG_LEVEL")
     @classmethod
     def validate_log_level(cls, value: str) -> str:
@@ -483,6 +682,89 @@ class Settings(BaseSettings):
                 environment=self.ENVIRONMENT,
             )
 
+        # Stage 3C OAuth Configuration Invariants (REV12)
+        if (
+            len(
+                {
+                    self.REFRESH_COOKIE_NAME,
+                    self.OAUTH_BINDING_COOKIE_NAME,
+                    self.OAUTH_EXCHANGE_COOKIE_NAME,
+                }
+            )
+            != 3
+        ):
+            raise ValueError(
+                "REFRESH_COOKIE_NAME, OAUTH_BINDING_COOKIE_NAME, and "
+                "OAUTH_EXCHANGE_COOKIE_NAME must be pairwise distinct"
+            )
+
+        if bool(self.GOOGLE_CLIENT_ID) != bool(self.GOOGLE_CLIENT_SECRET):
+            raise ValueError(
+                "GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET must both be configured or both unset"
+            )
+        if bool(self.GITHUB_CLIENT_ID) != bool(self.GITHUB_CLIENT_SECRET):
+            raise ValueError(
+                "GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET must both be configured or both unset"
+            )
+
+        if self.OAUTH_PKCE_ENCRYPTION_KEY is not None:
+            decode_aes256_base64url_key(
+                self.OAUTH_PKCE_ENCRYPTION_KEY.get_secret_value(),
+                field_name="OAUTH_PKCE_ENCRYPTION_KEY",
+            )
+        if self.OAUTH_PKCE_ENCRYPTION_KEY_PREVIOUS is not None:
+            if self.OAUTH_PKCE_ENCRYPTION_KEY is None:
+                raise ValueError(
+                    "OAUTH_PKCE_ENCRYPTION_KEY_PREVIOUS requires OAUTH_PKCE_ENCRYPTION_KEY"
+                )
+            decode_aes256_base64url_key(
+                self.OAUTH_PKCE_ENCRYPTION_KEY_PREVIOUS.get_secret_value(),
+                field_name="OAUTH_PKCE_ENCRYPTION_KEY_PREVIOUS",
+            )
+
+        if self.oauth_enabled and self.OAUTH_PKCE_ENCRYPTION_KEY is None:
+            raise ValueError(
+                "OAUTH_PKCE_ENCRYPTION_KEY is required whenever an OAuth provider is configured"
+            )
+
+        if self.OAUTH_ALLOWED_WEB_REDIRECT_URIS:
+            self.OAUTH_ALLOWED_WEB_REDIRECT_URIS = canonicalize_web_oauth_redirect_allowlist(
+                self.OAUTH_ALLOWED_WEB_REDIRECT_URIS,
+                environment=self.ENVIRONMENT,
+            )
+
+        if self.OAUTH_ALLOWED_MOBILE_REDIRECT_URIS:
+            if self.oauth_enabled or "OAUTH_ALLOWED_MOBILE_REDIRECT_URIS" in self.model_fields_set:
+                self.OAUTH_ALLOWED_MOBILE_REDIRECT_URIS = (
+                    canonicalize_mobile_oauth_redirect_allowlist(
+                        self.OAUTH_ALLOWED_MOBILE_REDIRECT_URIS,
+                        environment=self.ENVIRONMENT,
+                    )
+                )
+            elif self.ENVIRONMENT == "production":
+                # Do not expose dev default custom scheme allowlist when OAuth is disabled in production.
+                self.OAUTH_ALLOWED_MOBILE_REDIRECT_URIS = []
+            else:
+                self.OAUTH_ALLOWED_MOBILE_REDIRECT_URIS = (
+                    canonicalize_mobile_oauth_redirect_allowlist(
+                        self.OAUTH_ALLOWED_MOBILE_REDIRECT_URIS,
+                        environment=self.ENVIRONMENT,
+                    )
+                )
+
+        if self.oauth_enabled:
+            cors_origin_set = set(self.CORS_ORIGINS)
+            for web_uri in self.OAUTH_ALLOWED_WEB_REDIRECT_URIS:
+                parsed_web = parse_and_canonicalize_web_oauth_redirect_uri(
+                    web_uri,
+                    environment=self.ENVIRONMENT,
+                )
+                if parsed_web.origin not in cors_origin_set:
+                    raise ValueError(
+                        "Every origin in OAUTH_ALLOWED_WEB_REDIRECT_URIS must be an exact "
+                        "member of CORS_ORIGINS when OAuth is enabled (D19)"
+                    )
+
         return self
 
     def validate_runtime_requirements(self) -> None:
@@ -562,6 +844,22 @@ class Settings(BaseSettings):
                 environment="production",
             )
 
+        if self.oauth_enabled:
+            if urlsplit(self.BACKEND_BASE_URL).scheme.lower() != "https":
+                raise RuntimeError(
+                    "BACKEND_BASE_URL must use https:// in production when OAuth is enabled"
+                )
+            if self.OAUTH_ALLOWED_WEB_REDIRECT_URIS:
+                canonicalize_web_oauth_redirect_allowlist(
+                    self.OAUTH_ALLOWED_WEB_REDIRECT_URIS,
+                    environment="production",
+                )
+            if self.OAUTH_ALLOWED_MOBILE_REDIRECT_URIS:
+                canonicalize_mobile_oauth_redirect_allowlist(
+                    self.OAUTH_ALLOWED_MOBILE_REDIRECT_URIS,
+                    environment="production",
+                )
+
         if not self.PROXY_HEADERS_ENABLED:
             if self.TRUSTED_PROXY_IPS:
                 raise RuntimeError(
@@ -592,3 +890,53 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Return a cached singleton instance of application settings."""
     return Settings()
+
+
+def normalize_api_v1_prefix(api_v1_prefix: str) -> str:
+    """Normalize API_V1_PREFIX consistently across cookie paths, routers, and OAuth callback URLs."""
+    if type(api_v1_prefix) is not str:
+        raise ValueError("API_V1_PREFIX must be a string")
+    if not api_v1_prefix.isascii():
+        raise ValueError("API_V1_PREFIX must contain ASCII characters only")
+    if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in api_v1_prefix):
+        raise ValueError("API_V1_PREFIX must not contain whitespace or control characters")
+    for forbidden in ("?", "#", "\\", "//"):
+        if forbidden in api_v1_prefix:
+            raise ValueError(f"API_V1_PREFIX must not contain {forbidden!r}")
+    if MALFORMED_PERCENT_RE.search(api_v1_prefix):
+        raise ValueError("API_V1_PREFIX contains malformed percent encoding")
+    if OAUTH_FORBIDDEN_ENCODED_RE.search(api_v1_prefix):
+        raise ValueError(
+            "API_V1_PREFIX must not contain percent-encoded dot segments, separators, or control characters"
+        )
+    trimmed = api_v1_prefix.rstrip("/")
+    if not trimmed:
+        return ""
+    normalized = f"/{trimmed.lstrip('/')}"
+    for segment in normalized.split("/")[1:]:
+        if segment in {".", ".."}:
+            raise ValueError("API_V1_PREFIX must not contain dot segments")
+    return normalized
+
+
+def get_allowed_redirect_uris_snapshot(
+    settings: Settings,
+    client_type: Literal["web", "mobile"],
+) -> frozenset[str]:
+    """Return an immutable snapshot of configured redirect URIs for the requested client_type."""
+    if client_type == "web":
+        return frozenset(settings.OAUTH_ALLOWED_WEB_REDIRECT_URIS)
+    if client_type == "mobile":
+        return frozenset(settings.OAUTH_ALLOWED_MOBILE_REDIRECT_URIS)
+    raise ValueError(f"Unsupported client_type: {client_type!r}")
+
+
+def get_oauth_callback_url(
+    settings: Settings,
+    provider: Literal["google", "github"],
+) -> str:
+    """Build the authoritative server-side OAuth callback URL from BACKEND_BASE_URL + API_V1_PREFIX."""
+    if provider not in {"google", "github"}:
+        raise ValueError(f"Unsupported OAuth provider: {provider!r}")
+    prefix = normalize_api_v1_prefix(settings.API_V1_PREFIX)
+    return f"{settings.BACKEND_BASE_URL}{prefix}/auth/oauth/{provider}/callback"

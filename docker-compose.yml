@@ -96,6 +96,9 @@ services:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_DEV_APP_USER:-folio360_dev_app}:${POSTGRES_DEV_APP_PASSWORD:-folio360_dev_app_pass}@db:5432/${POSTGRES_DEV_DB:-folio360_dev}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:-dev-only-placeholder-jwt-secret-key-at-least-32-chars}
       FRONTEND_BASE_URL: ${FRONTEND_BASE_URL:-http://localhost:5173}
+      BACKEND_BASE_URL: ${BACKEND_BASE_URL:-http://localhost:8000}
+      OAUTH_ALLOWED_WEB_REDIRECT_URIS: ${OAUTH_ALLOWED_WEB_REDIRECT_URIS:-["http://localhost:5173/auth/oauth/callback"]}
+      OAUTH_ALLOWED_MOBILE_REDIRECT_URIS: ${OAUTH_ALLOWED_MOBILE_REDIRECT_URIS:-["folio360://auth/callback"]}
       EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:-no-reply@folio360.local}
       PROXY_HEADERS_ENABLED: ${PROXY_HEADERS_ENABLED:-false}
       TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-[]}

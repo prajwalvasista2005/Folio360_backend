@@ -11,6 +11,16 @@ from sqlalchemy.pool import NullPool
 from app.core.config import get_settings
 from tests.conftest import build_alembic_config, verify_test_database_identity
 
+ALL_MIGRATED_TABLES: tuple[str, ...] = (
+    "users",
+    "email_verification_tokens",
+    "refresh_sessions",
+    "password_reset_tokens",
+    "oauth_accounts",
+    "oauth_states",
+    "oauth_exchange_codes",
+)
+
 
 @pytest.mark.db
 @pytest.mark.migration
@@ -23,10 +33,11 @@ def test_alembic_0001_populated_upgrade_to_head_reversibility_and_schema_check(
     Verify:
       1. Downgrade to base drops all tables.
       2. Upgrade to 0001_create_users preserves exact original 5-column users schema without auth tables.
-      3. Populated 0001_create_users row upgrades cleanly to head (0003_add_password_reset_tokens) with defaults.
-      4. Full Stage 3A+3B schema (users, email_verification_tokens, password_reset_tokens, refresh_sessions)
-         and absence of Stage 3C tables.
-      5. Round-trip downgrade 0002 -> 0001 -> head -> downgrade base -> upgrade head -> alembic check.
+      3. Populated 0001_create_users row upgrades to 0003_add_password_reset_tokens without Stage 3C tables,
+         and then upgrades to head (0004_add_oauth_tables) with defaults and full OAuth schema.
+      4. Full Stage 3A+3B+3C.3 schema (users, email_verification_tokens, password_reset_tokens,
+         refresh_sessions, oauth_accounts, oauth_states, oauth_exchange_codes).
+      5. Round-trip downgrade 0003 -> 0002 -> 0001 -> head -> downgrade base -> upgrade head -> alembic check.
     """
     verify_test_database_identity(test_database_url, allow_migrator=False)
     verify_test_database_identity(test_migration_database_url, allow_migrator=True)
@@ -51,9 +62,8 @@ def test_alembic_0001_populated_upgrade_to_head_reversibility_and_schema_check(
         # 1. Downgrade to base drops all tables
         command.downgrade(cfg, "base")
         base_inspector = inspect(migrator_inspect_engine)
-        assert base_inspector.has_table("users") is False
-        assert base_inspector.has_table("email_verification_tokens") is False
-        assert base_inspector.has_table("refresh_sessions") is False
+        for tbl in ALL_MIGRATED_TABLES:
+            assert base_inspector.has_table(tbl) is False
 
         # 2. Upgrade to original Stage 2 baseline 0001_create_users
         command.upgrade(cfg, "0001_create_users")
@@ -89,21 +99,32 @@ def test_alembic_0001_populated_upgrade_to_head_reversibility_and_schema_check(
                 {"email": "legacy.stage2@example.com"},
             )
 
-        # 3. Upgrade populated 0001 DB to head (0003_add_password_reset_tokens)
+        # 3. Upgrade populated 0001 DB first to 0003_add_password_reset_tokens (pre-Stage 3C)
+        command.upgrade(cfg, "0003_add_password_reset_tokens")
+        stage3b_inspector = inspect(migrator_inspect_engine)
+        assert stage3b_inspector.has_table("users") is True
+        assert stage3b_inspector.has_table("email_verification_tokens") is True
+        assert stage3b_inspector.has_table("password_reset_tokens") is True
+        assert stage3b_inspector.has_table("refresh_sessions") is True
+
+        # Ensure Stage 3C tables are NOT present at 0003_add_password_reset_tokens
+        for excluded_table in (
+            "oauth_accounts",
+            "oauth_states",
+            "oauth_exchange_codes",
+        ):
+            assert stage3b_inspector.has_table(excluded_table) is False
+
+        # Upgrade populated DB to head (0004_add_oauth_tables)
         command.upgrade(cfg, "head")
         head_inspector = inspect(migrator_inspect_engine)
         assert head_inspector.has_table("users") is True
         assert head_inspector.has_table("email_verification_tokens") is True
         assert head_inspector.has_table("password_reset_tokens") is True
         assert head_inspector.has_table("refresh_sessions") is True
-
-        # Ensure Stage 3C tables are NOT present
-        for excluded_table in (
-            "oauth_accounts",
-            "oauth_states",
-            "oauth_exchange_codes",
-        ):
-            assert head_inspector.has_table(excluded_table) is False
+        assert head_inspector.has_table("oauth_accounts") is True
+        assert head_inspector.has_table("oauth_states") is True
+        assert head_inspector.has_table("oauth_exchange_codes") is True
 
         # Verify legacy populated user received exact Rev10 defaults
         with migrator_inspect_engine.connect() as conn:
@@ -293,7 +314,182 @@ def test_alembic_0001_populated_upgrade_to_head_reversibility_and_schema_check(
         assert prt_fks[0]["referred_table"] == "users"
         assert prt_fks[0]["options"].get("ondelete") == "CASCADE"
 
-        # 5. Reversibility: head -> 0002 -> 0001 -> head -> base -> head -> alembic check
+        # Verify oauth_accounts schema (Stage 3C.3)
+        oa_cols = {col["name"]: col for col in head_inspector.get_columns("oauth_accounts")}
+        assert set(oa_cols.keys()) == {
+            "id",
+            "user_id",
+            "provider",
+            "provider_user_id",
+            "provider_email",
+            "provider_email_verified",
+            "created_at",
+            "updated_at",
+        }
+        assert oa_cols["user_id"]["nullable"] is False
+        assert oa_cols["provider"]["nullable"] is False
+        assert getattr(oa_cols["provider"]["type"], "length", None) == 32
+        assert oa_cols["provider_user_id"]["nullable"] is False
+        assert getattr(oa_cols["provider_user_id"]["type"], "length", None) == 255
+        assert oa_cols["provider_email"]["nullable"] is True
+        assert getattr(oa_cols["provider_email"]["type"], "length", None) == 320
+        assert oa_cols["provider_email_verified"]["nullable"] is False
+        assert head_inspector.get_pk_constraint("oauth_accounts")["name"] == "pk_oauth_accounts"
+        oa_uniques = {
+            uc["name"]: uc["column_names"]
+            for uc in head_inspector.get_unique_constraints("oauth_accounts")
+        }
+        assert oa_uniques == {
+            "uq_oauth_accounts_provider_subject": ["provider", "provider_user_id"],
+            "uq_oauth_accounts_user_provider": ["user_id", "provider"],
+        }
+        oa_checks = {
+            cc["name"] for cc in head_inspector.get_check_constraints("oauth_accounts")
+        }
+        assert oa_checks == {
+            "ck_oauth_accounts_provider",
+            "ck_oauth_accounts_provider_user_id_valid",
+            "ck_oauth_accounts_provider_email_canonical",
+            "ck_oauth_accounts_email_verified_consistency",
+        }
+        oa_indexes = {idx["name"] for idx in head_inspector.get_indexes("oauth_accounts")}
+        assert "ix_oauth_accounts_user_id" in oa_indexes
+        oa_fks = head_inspector.get_foreign_keys("oauth_accounts")
+        assert len(oa_fks) == 1
+        assert oa_fks[0]["referred_table"] == "users"
+        assert oa_fks[0]["options"].get("ondelete") == "CASCADE"
+
+        # Verify oauth_states schema (Stage 3C.3)
+        os_cols = {col["name"]: col for col in head_inspector.get_columns("oauth_states")}
+        assert set(os_cols.keys()) == {
+            "id",
+            "state_hash",
+            "provider",
+            "client_type",
+            "pkce_verifier_encrypted",
+            "nonce_hash",
+            "redirect_uri",
+            "client_binding_hash",
+            "exchange_code_challenge_hash",
+            "expires_at",
+            "consumed_at",
+            "created_at",
+            "updated_at",
+        }
+        assert os_cols["state_hash"]["nullable"] is False
+        assert getattr(os_cols["state_hash"]["type"], "length", None) == 64
+        assert os_cols["provider"]["nullable"] is False
+        assert getattr(os_cols["provider"]["type"], "length", None) == 32
+        assert os_cols["client_type"]["nullable"] is False
+        assert getattr(os_cols["client_type"]["type"], "length", None) == 16
+        assert os_cols["pkce_verifier_encrypted"]["nullable"] is False
+        assert getattr(os_cols["pkce_verifier_encrypted"]["type"], "length", None) == 512
+        assert os_cols["nonce_hash"]["nullable"] is True
+        assert getattr(os_cols["nonce_hash"]["type"], "length", None) == 64
+        assert os_cols["redirect_uri"]["nullable"] is False
+        assert getattr(os_cols["redirect_uri"]["type"], "length", None) == 512
+        assert os_cols["client_binding_hash"]["nullable"] is True
+        assert getattr(os_cols["client_binding_hash"]["type"], "length", None) == 64
+        assert os_cols["exchange_code_challenge_hash"]["nullable"] is False
+        assert getattr(os_cols["exchange_code_challenge_hash"]["type"], "length", None) == 64
+        assert os_cols["expires_at"]["nullable"] is False
+        assert os_cols["consumed_at"]["nullable"] is True
+        assert head_inspector.get_pk_constraint("oauth_states")["name"] == "pk_oauth_states"
+        assert head_inspector.get_foreign_keys("oauth_states") == []
+        os_uniques = {
+            uc["name"]: uc["column_names"]
+            for uc in head_inspector.get_unique_constraints("oauth_states")
+        }
+        assert os_uniques == {"uq_oauth_states_state_hash": ["state_hash"]}
+        os_checks = {
+            cc["name"] for cc in head_inspector.get_check_constraints("oauth_states")
+        }
+        assert os_checks == {
+            "ck_oauth_states_provider",
+            "ck_oauth_states_client_type",
+            "ck_oauth_states_state_hash_hex",
+            "ck_oauth_states_exchange_code_challenge_hash_hex",
+            "ck_oauth_states_pkce_not_empty",
+            "ck_oauth_states_redirect_uri_valid",
+            "ck_oauth_states_nonce_hash_consistency",
+            "ck_oauth_states_client_binding_consistency",
+            "ck_oauth_states_consumed_pkce_scrubbed",
+        }
+        os_indexes = {idx["name"] for idx in head_inspector.get_indexes("oauth_states")}
+        assert "ix_oauth_states_expires_at" in os_indexes
+
+        # Verify oauth_exchange_codes schema (Stage 3C.3)
+        oec_cols = {
+            col["name"]: col for col in head_inspector.get_columns("oauth_exchange_codes")
+        }
+        assert set(oec_cols.keys()) == {
+            "id",
+            "user_id",
+            "code_hash",
+            "client_type",
+            "auth_version",
+            "exchange_code_challenge_hash",
+            "exchange_binding_hash",
+            "expires_at",
+            "consumed_at",
+            "created_at",
+            "updated_at",
+        }
+        assert oec_cols["user_id"]["nullable"] is False
+        assert oec_cols["code_hash"]["nullable"] is False
+        assert getattr(oec_cols["code_hash"]["type"], "length", None) == 64
+        assert oec_cols["client_type"]["nullable"] is False
+        assert getattr(oec_cols["client_type"]["type"], "length", None) == 16
+        assert oec_cols["auth_version"]["nullable"] is False
+        assert oec_cols["exchange_code_challenge_hash"]["nullable"] is False
+        assert getattr(oec_cols["exchange_code_challenge_hash"]["type"], "length", None) == 64
+        assert oec_cols["exchange_binding_hash"]["nullable"] is True
+        assert getattr(oec_cols["exchange_binding_hash"]["type"], "length", None) == 64
+        assert oec_cols["expires_at"]["nullable"] is False
+        assert oec_cols["consumed_at"]["nullable"] is True
+        assert (
+            head_inspector.get_pk_constraint("oauth_exchange_codes")["name"]
+            == "pk_oauth_exchange_codes"
+        )
+        oec_uniques = {
+            uc["name"]: uc["column_names"]
+            for uc in head_inspector.get_unique_constraints("oauth_exchange_codes")
+        }
+        assert oec_uniques == {"uq_oauth_exchange_codes_code_hash": ["code_hash"]}
+        oec_checks = {
+            cc["name"]
+            for cc in head_inspector.get_check_constraints("oauth_exchange_codes")
+        }
+        assert oec_checks == {
+            "ck_oauth_exchange_codes_hash_hex",
+            "ck_oauth_exchange_codes_client_type",
+            "ck_oauth_exchange_codes_auth_version_non_negative",
+            "ck_oauth_exchange_codes_exchange_code_challenge_hash_hex",
+            "ck_oauth_exchange_codes_exchange_binding_consistency",
+        }
+        oec_indexes = {
+            idx["name"] for idx in head_inspector.get_indexes("oauth_exchange_codes")
+        }
+        assert {
+            "ix_oauth_exchange_codes_user_id",
+            "ix_oauth_exchange_codes_expires_at",
+        }.issubset(oec_indexes)
+        oec_fks = head_inspector.get_foreign_keys("oauth_exchange_codes")
+        assert len(oec_fks) == 1
+        assert oec_fks[0]["referred_table"] == "users"
+        assert oec_fks[0]["options"].get("ondelete") == "CASCADE"
+
+        # 5. Reversibility: head -> 0003 -> 0002 -> 0001 -> head -> base -> head -> alembic check
+        command.downgrade(cfg, "0003_add_password_reset_tokens")
+        stage3b_post_downgrade = inspect(migrator_inspect_engine)
+        assert stage3b_post_downgrade.has_table("users") is True
+        assert stage3b_post_downgrade.has_table("email_verification_tokens") is True
+        assert stage3b_post_downgrade.has_table("password_reset_tokens") is True
+        assert stage3b_post_downgrade.has_table("refresh_sessions") is True
+        assert stage3b_post_downgrade.has_table("oauth_accounts") is False
+        assert stage3b_post_downgrade.has_table("oauth_states") is False
+        assert stage3b_post_downgrade.has_table("oauth_exchange_codes") is False
+
         command.downgrade(cfg, "0002_add_core_auth_tables")
         stage3a_inspector = inspect(migrator_inspect_engine)
         assert stage3a_inspector.has_table("users") is True
@@ -317,12 +513,16 @@ def test_alembic_0001_populated_upgrade_to_head_reversibility_and_schema_check(
 
         command.upgrade(cfg, "head")
         command.downgrade(cfg, "base")
+        second_base_inspector = inspect(migrator_inspect_engine)
+        for tbl in ALL_MIGRATED_TABLES:
+            assert second_base_inspector.has_table(tbl) is False
         command.upgrade(cfg, "head")
         command.check(cfg)
     finally:
         try:
             command.upgrade(build_alembic_config(test_migration_database_url), "head")
             with migrator_inspect_engine.begin() as conn:
+                conn.execute(text("DELETE FROM oauth_states"))
                 conn.execute(text("DELETE FROM users"))
         finally:
             migrator_inspect_engine.dispose()
@@ -343,7 +543,7 @@ def test_split_roles_enforce_dml_only_for_app_and_ddl_for_migrator(
     """
     Verify Rev10 §8 rule 5 & §20.2 least-privilege split-role isolation:
       - Application role owns neither schema nor migrated tables.
-      - Application role can SELECT/INSERT/UPDATE/DELETE on all Stage 3A+3B tables.
+      - Application role can SELECT/INSERT/UPDATE/DELETE on all Stage 3A+3B+3C.3 tables.
       - Application role is denied CREATE/ALTER/DROP/TRUNCATE DDL operations.
       - Migrator role owns migrated tables and holds DDL privileges.
     """
@@ -366,7 +566,8 @@ def test_split_roles_enforce_dml_only_for_app_and_ddl_for_migrator(
                     "SELECT tablename, tableowner FROM pg_tables "
                     "WHERE schemaname = 'public' "
                     "AND tablename IN ('users', 'email_verification_tokens', "
-                    "'password_reset_tokens', 'refresh_sessions')"
+                    "'password_reset_tokens', 'refresh_sessions', "
+                    "'oauth_accounts', 'oauth_states', 'oauth_exchange_codes')"
                 )
             ).all()
             assert dict(owners) == {
@@ -374,11 +575,14 @@ def test_split_roles_enforce_dml_only_for_app_and_ddl_for_migrator(
                 "email_verification_tokens": migrator_role,
                 "password_reset_tokens": migrator_role,
                 "refresh_sessions": migrator_role,
+                "oauth_accounts": migrator_role,
+                "oauth_states": migrator_role,
+                "oauth_exchange_codes": migrator_role,
             }
     finally:
         migrator_engine.dispose()
 
-    # App role DML succeeds across all Stage 3A+3B tables
+    # App role DML succeeds across all Stage 3A+3B+3C.3 tables
     with db_engine.begin() as conn:
         user_id = conn.execute(
             text(
@@ -419,6 +623,43 @@ def test_split_roles_enforce_dml_only_for_app_and_ddl_for_migrator(
             ),
             {"uid": user_id},
         )
+        conn.execute(
+            text(
+                "INSERT INTO oauth_accounts "
+                "(user_id, provider, provider_user_id, provider_email, provider_email_verified) "
+                "VALUES (:uid, 'google', 'sub-12345', 'dml.check@example.com', true)"
+            ),
+            {"uid": user_id},
+        )
+        state_id = conn.execute(
+            text(
+                "INSERT INTO oauth_states "
+                "(state_hash, provider, client_type, pkce_verifier_encrypted, "
+                "nonce_hash, redirect_uri, client_binding_hash, exchange_code_challenge_hash, expires_at) "
+                "VALUES (repeat('e', 64), 'google', 'web', 'v1:encrypted', "
+                "repeat('f', 64), 'http://localhost:5173/auth/oauth/callback', "
+                "repeat('0', 64), repeat('1', 64), now() + interval '10 minutes') "
+                "RETURNING id"
+            )
+        ).scalar_one()
+        conn.execute(
+            text(
+                "UPDATE oauth_states "
+                "SET consumed_at = now(), pkce_verifier_encrypted = '[CONSUMED]' "
+                "WHERE id = :sid"
+            ),
+            {"sid": state_id},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO oauth_exchange_codes "
+                "(user_id, code_hash, client_type, auth_version, "
+                "exchange_code_challenge_hash, exchange_binding_hash, expires_at) "
+                "VALUES (:uid, repeat('2', 64), 'mobile', 0, "
+                "repeat('3', 64), NULL, now() + interval '60 seconds')"
+            ),
+            {"uid": user_id},
+        )
         cnt = conn.execute(
             text("SELECT COUNT(*) FROM users WHERE id = :uid"),
             {"uid": user_id},
@@ -428,6 +669,7 @@ def test_split_roles_enforce_dml_only_for_app_and_ddl_for_migrator(
             text("UPDATE users SET is_active = false WHERE id = :uid"),
             {"uid": user_id},
         )
+        conn.execute(text("DELETE FROM oauth_states WHERE id = :sid"), {"sid": state_id})
         conn.execute(text("DELETE FROM users WHERE id = :uid"), {"uid": user_id})
 
     # App role DDL and TRUNCATE must be denied with InsufficientPrivilege
@@ -436,7 +678,11 @@ def test_split_roles_enforce_dml_only_for_app_and_ddl_for_migrator(
         "ALTER TABLE public.users ADD COLUMN unauthorized_col text",
         "DROP TABLE public.refresh_sessions",
         "DROP TABLE public.password_reset_tokens",
+        "DROP TABLE public.oauth_accounts",
+        "DROP TABLE public.oauth_states",
+        "DROP TABLE public.oauth_exchange_codes",
         "TRUNCATE TABLE public.users CASCADE",
+        "TRUNCATE TABLE public.oauth_states",
     ):
         with pytest.raises(ProgrammingError):
             with db_engine.begin() as conn:

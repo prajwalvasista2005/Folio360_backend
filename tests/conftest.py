@@ -228,4 +228,5 @@ def committed_db_session(
     finally:
         session.close()
         with db_engine.begin() as conn:
+            conn.execute(text("DELETE FROM oauth_states"))
             conn.execute(text("DELETE FROM users"))

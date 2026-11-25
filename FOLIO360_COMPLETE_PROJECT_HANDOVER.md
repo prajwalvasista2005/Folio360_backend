@@ -1,12 +1,15 @@
 # FOLIO360 — COMPLETE TECHNICAL PROJECT HANDOVER
 
-**Document ID:** F360-HANDOVER-P0S1-REV1  
+**Document ID:** F360-HANDOVER-P0S1-REV1 *(Updated at Phase 0 Closure)*  
 **Project:** Folio360 (User-Centred Unified Profile for Academic, Professional, and Lifelong Learning Records)  
-**Repository Path:** `c:\Users\vasista0305\OneDrive\Desktop\folio360_backend`  
-**Current Branch:** `main`  
-**Authoritative Git HEAD:** `f3dc5d3c0f85ea03570281a0483f968187ff0d9e`  
-**Project Owner / Lead Developer:** Prajwal Vasista (`prajwalvasista8@gmail.com`)  
-**Document Purpose:** Complete technical orientation and operational handover for incoming Antigravity AI assistant sessions.
+**Authoritative Specifications:**
+- Core Auth (Stages 3A & 3B): [`F360-P0-AUTH-SPEC-REV10.md`](F360-P0-AUTH-SPEC-REV10.md)
+- OAuth 2.0 / OIDC (Stages 3C.1–3C.7): `F360-S3C-SPEC-REV12` (`Supersedes: REV1–REV11`, SHA-256 `f83ef10096caf9b3d7d264cd10b9ff3a3822b594a4de9ff9d5e90a1834643f83`)
+- Historical drafts (`REV3`–`REV9`): archived in [`docs/archive/superseded_specs/`](docs/archive/superseded_specs/README.md)
+
+**Current Phase Gate:** **Phase 0 Authentication COMPLETE & ACCEPTED** (Stages 1, 2, 3A, 3B, and 3C.1–3C.7); Alembic at head `0004_add_oauth_tables`; **Phase 1 — Profile Creation** is the next pending phase (awaiting separate specification approval).
+
+> **Historical Note:** Sections 1–10 below preserve the original Phase 0 Stage 1 architecture handover for historical baseline reference, while the Roadmap Matrix below reflects the current accepted state.
 
 ---
 
@@ -158,10 +161,12 @@ The Folio360 backend is developed through phased, gated stages. Below is the aut
 
 | Phase | Stage | Description | Status | Verification & Deliverables |
 | :--- | :--- | :--- | :--- | :--- |
-| **Phase 0** | **Stage 1** | **Core Scaffolding & Foundation**<br>Python 3.13 setup, FastAPI factory, Pydantic settings, secure logging, exception framework, health endpoint. | **AWAITING REVIEW**<br>(Implementation complete, 43 passing tests) | 43 unit tests passing in Docker Linux container. Live HTTP 200 responses verified. Awaiting owner sign-off. |
-| **Phase 0** | **Stage 2** | **Database & ORM Foundations**<br>SQLAlchemy 2.0 synchronous engine, declarative Base, Alembic setup, initial migrations, User model. | **NOT STARTED** | Gated pending Stage 1 sign-off and explicit user authorization. |
-| **Phase 0** | **Stage 3** | **Authentication & Security**<br>Argon2 password hashing, JWT token generation, refresh tokens, auth routes, current user dependency. | **NOT STARTED** | Gated pending Stage 2 completion. |
-| **Phase 0** | **Stage 4** | **User Profile Core**<br>Student profile schemas, personal details, contact information, role assignments. | **NOT STARTED** | Gated pending Stage 3 completion. |
+| **Phase 0** | **Stage 1** | **Core Scaffolding & Foundation**<br>Python 3.13 setup, FastAPI factory, Pydantic settings, secure logging, exception framework, health endpoint. | **ACCEPTED** | Stage 1 verified & accepted. |
+| **Phase 0** | **Stage 2** | **Database & ORM Foundations**<br>SQLAlchemy 2.0 synchronous engine, declarative Base, Alembic (`0001_create_users`), split DB roles, `/health/ready`. | **ACCEPTED** | Live PostgreSQL 17 & migration verified. |
+| **Phase 0** | **Stage 3A** | **Core Authentication**<br>Argon2id, Resend email verification (`0002_add_core_auth_tables`), HS256 JWTs (`auth_version`), rotating refresh families, `Origin` CSRF, IP rate limits, ASGI3 Uvicorn entrypoint. | **ACCEPTED** | Per [`F360-P0-AUTH-SPEC-REV10.md`](F360-P0-AUTH-SPEC-REV10.md). |
+| **Phase 0** | **Stage 3B** | **Password Reset & Change**<br>`/forgot-password`, `/reset-password`, `/change-password`, `0003_add_password_reset_tokens`. | **ACCEPTED** | Per [`F360-P0-AUTH-SPEC-REV10.md`](F360-P0-AUTH-SPEC-REV10.md). |
+| **Phase 0** | **Stage 3C (3C.1–3C.7)** | **Google OIDC & GitHub OAuth 2.0**<br>Config/keys/logging, PKCE/AES-256-GCM, `0004_add_oauth_tables`, providers & `HttpxJWKClient`, orchestration & SAVEPOINT recovery, HTTP routes & ASGI middleware, security/e2e verification. | **ACCEPTED** | Per `F360-S3C-SPEC-REV12` (`629` total repository tests passing). |
+| **Phase 0 / Phase 1** | **Profile Creation** | **User Profile Core / Academic Records**<br>Student profile schemas, CRUD endpoints, and domain models. | **NOT STARTED** | Next phase; requires separate specification & owner approval. |
 | **Phase 1** | **Stage 1** | **VTU Semester Records**<br>Semester models (1-8), course codes, credits, grades, marks schemas, CRUD endpoints. | **NOT STARTED** | Planned. |
 | **Phase 1** | **Stage 2** | **VTU GPA Calculation Engine**<br>Automated SGPA/CGPA algorithm adhering to VTU credit-weighting rules, backlogs, grade points. | **NOT STARTED** | Planned. |
 | **Phase 1** | **Stage 3** | **Academic Verification**<br>Transcript reconciliation and institutional grade verification flags. | **NOT STARTED** | Planned. |
@@ -173,8 +178,8 @@ The Folio360 backend is developed through phased, gated stages. Below is the aut
 | **Phase 4** | **Stage 2** | **Public Shareable Profiles**<br>Scoped public profile links with vanity slugs and configurable privacy controls. | **NOT STARTED** | Planned. |
 | **Phase 5** | **Stage 1** | **Recruiter & Institutional Portal**<br>Candidate search, bulk transcript verification, institutional audit logs. | **NOT STARTED** | Planned. |
 
-> [!IMPORTANT]
-> **Strict Phase Boundary:** No work has begun on Phase 0 Stage 2 or beyond. Verified implementation exists **ONLY** in Phase 0 Stage 1.
+> [!NOTE]
+> **Historical Archive Boundary:** The deep-dive file tree in Sections 5–10 below records the original Phase 0 Stage 1 snapshot (`F360-HANDOVER-P0S1-REV1`). Current Phase 0 Stages 1–3C modules, APIs, and Docker test commands are documented in [`README.md`](README.md). No Phase 1 (Profile Creation) code or specification exists yet.
 
 ---
 

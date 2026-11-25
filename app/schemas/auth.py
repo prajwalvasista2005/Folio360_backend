@@ -1,6 +1,7 @@
 """Pydantic v2 request and response schemas for Stage 3A/3B authentication endpoints."""
 
 from datetime import datetime
+import re
 from typing import Any, Literal
 import uuid
 
@@ -129,9 +130,10 @@ class UserPublicResponse(BaseModel):
 
 
 class MeResponse(UserPublicResponse):
-    """Response payload for GET /api/v1/auth/me (Stage 3A)."""
+    """Response payload for GET /api/v1/auth/me (Stage 3A + 3C D15)."""
 
     updated_at: datetime
+    oauth_providers: list[str] = Field(default_factory=list)
 
 
 class RegisterResponse(BaseModel):
@@ -245,3 +247,36 @@ class MobilePasswordChangeResponse(WebPasswordChangeResponse):
 
     refresh_token: str
     refresh_expires_in: int
+
+
+_OAUTH_EXCHANGE_VERIFIER_RE = re.compile(r"\A[A-Za-z0-9._~-]{43,128}\Z")
+
+
+class OAuthExchangeRequest(BaseModel):
+    """Request payload for POST /api/v1/auth/oauth/exchange (REV12 §8)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: str
+    exchange_code_verifier: str
+
+    @field_validator("code", mode="before")
+    @classmethod
+    def validate_unmodified_code(cls, value: Any) -> str:
+        """Accept unmodified non-empty opaque exchange code without stripping or echoing."""
+        if (
+            type(value) is not str
+            or not (1 <= len(value) <= 512)
+            or value != value.strip()
+            or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value)
+        ):
+            raise ValueError("Invalid OAuth exchange code format")
+        return value
+
+    @field_validator("exchange_code_verifier", mode="before")
+    @classmethod
+    def validate_unmodified_verifier(cls, value: Any) -> str:
+        """Accept unmodified RFC 7636 verifier (43..128 unreserved chars) without echoing."""
+        if type(value) is not str or not _OAUTH_EXCHANGE_VERIFIER_RE.fullmatch(value):
+            raise ValueError("Invalid OAuth exchange_code_verifier format")
+        return value

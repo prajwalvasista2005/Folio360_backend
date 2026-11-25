@@ -204,7 +204,7 @@ def test_register_verify_email_no_auto_login_and_me_flow(
         assert login_data["access_token"]
         assert login_data["refresh_token"]
 
-        # 9. GET /api/v1/auth/me returns Stage 3A profile (no oauth_providers)
+        # 9. GET /api/v1/auth/me returns profile with empty oauth_providers for password-only user (D15)
         me_resp = client.get(
             "/api/v1/auth/me",
             headers={"Authorization": f"Bearer {login_data['access_token']}"},
@@ -214,7 +214,7 @@ def test_register_verify_email_no_auto_login_and_me_flow(
         assert me_data["email"] == "alice.student@example.com"
         assert me_data["is_email_verified"] is True
         assert me_data["has_password"] is True
-        assert "oauth_providers" not in me_data
+        assert me_data["oauth_providers"] == []
 
 
 @pytest.mark.db

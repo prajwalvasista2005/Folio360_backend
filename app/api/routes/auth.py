@@ -43,7 +43,7 @@ from app.schemas.auth import (
     WebAuthTokenResponse,
     WebPasswordChangeResponse,
 )
-from app.services import auth_service
+from app.services import auth_service, oauth_service
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -364,8 +364,13 @@ def logout_all(
 )
 def get_me(
     current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> MeResponse:
-    """Return the authenticated user's Stage 3A profile information."""
+    """Return the authenticated user's Stage 3A profile information plus linked OAuth providers."""
+    oauth_providers = oauth_service.list_user_oauth_providers(
+        db,
+        user_id=current_user.id,
+    )
     return MeResponse(
         id=current_user.id,
         email=current_user.email,
@@ -374,6 +379,7 @@ def get_me(
         has_password=current_user.password_hash is not None,
         created_at=current_user.created_at,
         updated_at=current_user.updated_at,
+        oauth_providers=oauth_providers,
     )
 
 
