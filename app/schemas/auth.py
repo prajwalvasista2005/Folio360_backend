@@ -126,6 +126,7 @@ class UserPublicResponse(BaseModel):
     is_active: bool
     is_email_verified: bool
     has_password: bool
+    profile_completed: bool = False
     created_at: datetime
 
 

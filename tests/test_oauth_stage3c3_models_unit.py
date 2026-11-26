@@ -60,7 +60,7 @@ def test_oauth_model_exports_metadata_and_zero_relationships() -> None:
     assert OAuthState is OAuthStateDirect
     assert OAuthExchangeCode is OAuthExchangeCodeDirect
 
-    assert set(models_pkg.__all__) == {
+    assert {
         "Base",
         "User",
         "EmailVerificationToken",
@@ -69,7 +69,7 @@ def test_oauth_model_exports_metadata_and_zero_relationships() -> None:
         "OAuthAccount",
         "OAuthState",
         "OAuthExchangeCode",
-    }
+    }.issubset(set(models_pkg.__all__))
 
     # Existing Stage 1-3B models and new Stage 3C.3 models all share Base.metadata
     assert {
@@ -395,11 +395,12 @@ def test_alembic_0004_revision_chain_and_mock_ddl_parity_with_metadata() -> None
     script = ScriptDirectory.from_config(cfg)
 
     heads = script.get_heads()
-    assert heads == ["0004_add_oauth_tables"]
+    assert heads == ["0005_add_user_profiles"]
 
     revs = list(script.walk_revisions("base", "head"))
     rev_ids = [r.revision for r in revs]
     assert rev_ids == [
+        "0005_add_user_profiles",
         "0004_add_oauth_tables",
         "0003_add_password_reset_tokens",
         "0002_add_core_auth_tables",

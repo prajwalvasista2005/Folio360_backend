@@ -19,6 +19,8 @@ ALL_MIGRATED_TABLES: tuple[str, ...] = (
     "oauth_accounts",
     "oauth_states",
     "oauth_exchange_codes",
+    "user_profiles",
+    "user_profile_activities",
 )
 
 
@@ -115,7 +117,14 @@ def test_alembic_0001_populated_upgrade_to_head_reversibility_and_schema_check(
         ):
             assert stage3b_inspector.has_table(excluded_table) is False
 
-        # Upgrade populated DB to head (0004_add_oauth_tables)
+        # Upgrade populated DB to 0004_add_oauth_tables (pre-Phase 1 profiles)
+        command.upgrade(cfg, "0004_add_oauth_tables")
+        stage3c_inspector = inspect(migrator_inspect_engine)
+        assert stage3c_inspector.has_table("oauth_accounts") is True
+        assert stage3c_inspector.has_table("user_profiles") is False
+        assert stage3c_inspector.has_table("user_profile_activities") is False
+
+        # Upgrade populated DB to head (0005_add_user_profiles)
         command.upgrade(cfg, "head")
         head_inspector = inspect(migrator_inspect_engine)
         assert head_inspector.has_table("users") is True
@@ -125,6 +134,8 @@ def test_alembic_0001_populated_upgrade_to_head_reversibility_and_schema_check(
         assert head_inspector.has_table("oauth_accounts") is True
         assert head_inspector.has_table("oauth_states") is True
         assert head_inspector.has_table("oauth_exchange_codes") is True
+        assert head_inspector.has_table("user_profiles") is True
+        assert head_inspector.has_table("user_profile_activities") is True
 
         # Verify legacy populated user received exact Rev10 defaults
         with migrator_inspect_engine.connect() as conn:
@@ -479,7 +490,120 @@ def test_alembic_0001_populated_upgrade_to_head_reversibility_and_schema_check(
         assert oec_fks[0]["referred_table"] == "users"
         assert oec_fks[0]["options"].get("ondelete") == "CASCADE"
 
-        # 5. Reversibility: head -> 0003 -> 0002 -> 0001 -> head -> base -> head -> alembic check
+        # Verify user_profiles schema (Phase 1)
+        up_cols = {col["name"]: col for col in head_inspector.get_columns("user_profiles")}
+        assert set(up_cols.keys()) == {
+            "id",
+            "user_id",
+            "slug",
+            "full_name",
+            "date_of_birth",
+            "bio",
+            "profile_picture_url",
+            "interests",
+            "profile_completed",
+            "profile_completed_at",
+            "created_at",
+            "updated_at",
+        }
+        assert up_cols["user_id"]["nullable"] is False
+        assert up_cols["slug"]["nullable"] is True
+        assert getattr(up_cols["slug"]["type"], "length", None) == 30
+        assert up_cols["full_name"]["nullable"] is True
+        assert getattr(up_cols["full_name"]["type"], "length", None) == 150
+        assert up_cols["date_of_birth"]["nullable"] is True
+        assert up_cols["bio"]["nullable"] is True
+        assert getattr(up_cols["bio"]["type"], "length", None) == 500
+        assert up_cols["profile_picture_url"]["nullable"] is True
+        assert getattr(up_cols["profile_picture_url"]["type"], "length", None) == 512
+        assert up_cols["interests"]["nullable"] is False
+        assert up_cols["profile_completed"]["nullable"] is False
+        assert up_cols["profile_completed_at"]["nullable"] is True
+        assert head_inspector.get_pk_constraint("user_profiles")["name"] == "pk_user_profiles"
+        up_uniques = {
+            uc["name"]: uc["column_names"]
+            for uc in head_inspector.get_unique_constraints("user_profiles")
+        }
+        assert up_uniques == {
+            "uq_user_profiles_user_id": ["user_id"],
+            "uq_user_profiles_slug": ["slug"],
+        }
+        up_checks = {
+            cc["name"] for cc in head_inspector.get_check_constraints("user_profiles")
+        }
+        assert up_checks == {
+            "ck_user_profiles_slug_canonical",
+            "ck_user_profiles_full_name_valid",
+            "ck_user_profiles_bio_valid",
+            "ck_user_profiles_picture_url_valid",
+            "ck_user_profiles_interests_array",
+            "ck_user_profiles_completion_consistency",
+        }
+        up_fks = head_inspector.get_foreign_keys("user_profiles")
+        assert len(up_fks) == 1
+        assert up_fks[0]["referred_table"] == "users"
+        assert up_fks[0]["options"].get("ondelete") == "CASCADE"
+
+        # Verify user_profile_activities schema (Phase 1)
+        upa_cols = {
+            col["name"]: col
+            for col in head_inspector.get_columns("user_profile_activities")
+        }
+        assert set(upa_cols.keys()) == {
+            "id",
+            "profile_id",
+            "activity_key",
+            "custom_label",
+            "description",
+            "display_order",
+            "created_at",
+            "updated_at",
+        }
+        assert upa_cols["profile_id"]["nullable"] is False
+        assert upa_cols["activity_key"]["nullable"] is False
+        assert getattr(upa_cols["activity_key"]["type"], "length", None) == 32
+        assert upa_cols["custom_label"]["nullable"] is True
+        assert getattr(upa_cols["custom_label"]["type"], "length", None) == 80
+        assert upa_cols["description"]["nullable"] is True
+        assert getattr(upa_cols["description"]["type"], "length", None) == 200
+        assert upa_cols["display_order"]["nullable"] is False
+        assert (
+            head_inspector.get_pk_constraint("user_profile_activities")["name"]
+            == "pk_user_profile_activities"
+        )
+        upa_uniques = {
+            uc["name"]: uc["column_names"]
+            for uc in head_inspector.get_unique_constraints("user_profile_activities")
+        }
+        assert upa_uniques == {
+            "uq_user_profile_activities_profile_key": ["profile_id", "activity_key"],
+        }
+        upa_checks = {
+            cc["name"]
+            for cc in head_inspector.get_check_constraints("user_profile_activities")
+        }
+        assert upa_checks == {
+            "ck_user_profile_activities_activity_key",
+            "ck_user_profile_activities_custom_label_consistency",
+            "ck_user_profile_activities_description_valid",
+            "ck_user_profile_activities_display_order_non_negative",
+        }
+        upa_indexes = {
+            idx["name"] for idx in head_inspector.get_indexes("user_profile_activities")
+        }
+        assert "ix_user_profile_activities_profile_id" in upa_indexes
+        upa_fks = head_inspector.get_foreign_keys("user_profile_activities")
+        assert len(upa_fks) == 1
+        assert upa_fks[0]["referred_table"] == "user_profiles"
+        assert upa_fks[0]["options"].get("ondelete") == "CASCADE"
+
+        # 5. Reversibility: head -> 0004 -> 0003 -> 0002 -> 0001 -> head -> base -> head -> alembic check
+        command.downgrade(cfg, "0004_add_oauth_tables")
+        stage3c_post_downgrade = inspect(migrator_inspect_engine)
+        assert stage3c_post_downgrade.has_table("oauth_accounts") is True
+        assert stage3c_post_downgrade.has_table("user_profiles") is False
+        assert stage3c_post_downgrade.has_table("user_profile_activities") is False
+
         command.downgrade(cfg, "0003_add_password_reset_tokens")
         stage3b_post_downgrade = inspect(migrator_inspect_engine)
         assert stage3b_post_downgrade.has_table("users") is True
@@ -567,7 +691,8 @@ def test_split_roles_enforce_dml_only_for_app_and_ddl_for_migrator(
                     "WHERE schemaname = 'public' "
                     "AND tablename IN ('users', 'email_verification_tokens', "
                     "'password_reset_tokens', 'refresh_sessions', "
-                    "'oauth_accounts', 'oauth_states', 'oauth_exchange_codes')"
+                    "'oauth_accounts', 'oauth_states', 'oauth_exchange_codes', "
+                    "'user_profiles', 'user_profile_activities')"
                 )
             ).all()
             assert dict(owners) == {
@@ -578,6 +703,8 @@ def test_split_roles_enforce_dml_only_for_app_and_ddl_for_migrator(
                 "oauth_accounts": migrator_role,
                 "oauth_states": migrator_role,
                 "oauth_exchange_codes": migrator_role,
+                "user_profiles": migrator_role,
+                "user_profile_activities": migrator_role,
             }
     finally:
         migrator_engine.dispose()
@@ -660,6 +787,23 @@ def test_split_roles_enforce_dml_only_for_app_and_ddl_for_migrator(
             ),
             {"uid": user_id},
         )
+        profile_id = conn.execute(
+            text(
+                "INSERT INTO user_profiles "
+                "(user_id, slug, full_name, date_of_birth, interests, profile_completed, profile_completed_at) "
+                "VALUES (:uid, 'dml_user', 'DML Check User', '2000-01-15', '[\"Python\"]'::jsonb, true, now()) "
+                "RETURNING id"
+            ),
+            {"uid": user_id},
+        ).scalar_one()
+        conn.execute(
+            text(
+                "INSERT INTO user_profile_activities "
+                "(profile_id, activity_key, custom_label, description, display_order) "
+                "VALUES (:pid, 'studying', NULL, 'B.E. CS', 0)"
+            ),
+            {"pid": profile_id},
+        )
         cnt = conn.execute(
             text("SELECT COUNT(*) FROM users WHERE id = :uid"),
             {"uid": user_id},
@@ -681,8 +825,11 @@ def test_split_roles_enforce_dml_only_for_app_and_ddl_for_migrator(
         "DROP TABLE public.oauth_accounts",
         "DROP TABLE public.oauth_states",
         "DROP TABLE public.oauth_exchange_codes",
+        "DROP TABLE public.user_profile_activities",
+        "DROP TABLE public.user_profiles",
         "TRUNCATE TABLE public.users CASCADE",
         "TRUNCATE TABLE public.oauth_states",
+        "TRUNCATE TABLE public.user_profiles CASCADE",
     ):
         with pytest.raises(ProgrammingError):
             with db_engine.begin() as conn:

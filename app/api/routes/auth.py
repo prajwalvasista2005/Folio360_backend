@@ -43,7 +43,7 @@ from app.schemas.auth import (
     WebAuthTokenResponse,
     WebPasswordChangeResponse,
 )
-from app.services import auth_service, oauth_service
+from app.services import auth_service, oauth_service, profile_service
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -58,13 +58,18 @@ def _get_refresh_cookie_path(settings: Settings) -> str:
     return f"{prefix}/auth"
 
 
-def _to_user_public(user: User) -> UserPublicResponse:
+def _to_user_public(
+    user: User,
+    *,
+    profile_completed: bool = False,
+) -> UserPublicResponse:
     return UserPublicResponse(
         id=user.id,
         email=user.email,
         is_active=user.is_active,
         is_email_verified=user.is_email_verified,
         has_password=user.password_hash is not None,
+        profile_completed=profile_completed,
         created_at=user.created_at,
     )
 
@@ -202,7 +207,10 @@ def login(
         ip_address=resolve_client_ip(request),
         settings=settings,
     )
-    user_public = _to_user_public(user)
+    user_public = _to_user_public(
+        user,
+        profile_completed=profile_service.is_profile_completed(db, user_id=user.id),
+    )
 
     if client_type == "web":
         _set_refresh_cookie(
@@ -272,7 +280,10 @@ def refresh(
             exc.headers = headers
         raise
 
-    user_public = _to_user_public(user)
+    user_public = _to_user_public(
+        user,
+        profile_completed=profile_service.is_profile_completed(db, user_id=user.id),
+    )
     if client_type == "web":
         _set_refresh_cookie(
             response,
@@ -371,12 +382,17 @@ def get_me(
         db,
         user_id=current_user.id,
     )
+    profile_completed = profile_service.is_profile_completed(
+        db,
+        user_id=current_user.id,
+    )
     return MeResponse(
         id=current_user.id,
         email=current_user.email,
         is_active=current_user.is_active,
         is_email_verified=current_user.is_email_verified,
         has_password=current_user.password_hash is not None,
+        profile_completed=profile_completed,
         created_at=current_user.created_at,
         updated_at=current_user.updated_at,
         oauth_providers=oauth_providers,
@@ -468,7 +484,10 @@ def change_password(
             settings=settings,
         )
     )
-    user_public = _to_user_public(user)
+    user_public = _to_user_public(
+        user,
+        profile_completed=profile_service.is_profile_completed(db, user_id=user.id),
+    )
 
     if client_type == "web":
         _set_refresh_cookie(

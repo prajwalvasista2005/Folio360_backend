@@ -122,6 +122,7 @@ class AppException(Exception):
         details: Optional[Any] = None,
         public_message: Optional[str] = None,
         headers: Optional[dict[str, str]] = None,
+        error_code: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -129,6 +130,7 @@ class AppException(Exception):
         self.details = details
         self.public_message = public_message
         self.headers = headers
+        self.error_code = error_code
 
 
 class ResourceNotFoundError(AppException):
@@ -139,12 +141,14 @@ class ResourceNotFoundError(AppException):
         message: str = "Resource not found",
         details: Optional[Any] = None,
         public_message: Optional[str] = None,
+        error_code: Optional[str] = None,
     ) -> None:
         super().__init__(
             message=message,
             status_code=status.HTTP_404_NOT_FOUND,
             details=details,
             public_message=public_message,
+            error_code=error_code,
         )
 
 
@@ -156,12 +160,14 @@ class ValidationAppError(AppException):
         message: str = "Validation failed",
         details: Optional[Any] = None,
         public_message: Optional[str] = None,
+        error_code: Optional[str] = None,
     ) -> None:
         super().__init__(
             message=message,
             status_code=HTTP_422_STATUS,
             details=details,
             public_message=public_message,
+            error_code=error_code,
         )
 
 
@@ -206,15 +212,19 @@ async def app_exception_handler(request: Request, exc: AppException) -> JSONResp
             sanitized_details,
         )
 
+    error_payload: dict[str, Any] = {
+        "message": public_message,
+        "status_code": exc.status_code,
+        "details": public_details,
+    }
+    if exc.error_code and exc.status_code < status.HTTP_500_INTERNAL_SERVER_ERROR:
+        cleaned_code = sanitize_log_text(str(exc.error_code).strip())
+        if cleaned_code:
+            error_payload["code"] = cleaned_code
+
     return JSONResponse(
         status_code=exc.status_code,
-        content={
-            "error": {
-                "message": public_message,
-                "status_code": exc.status_code,
-                "details": public_details,
-            }
-        },
+        content={"error": error_payload},
         headers=exc.headers,
     )
 

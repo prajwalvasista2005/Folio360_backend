@@ -27,7 +27,7 @@ from app.schemas.auth import (
     OAuthExchangeRequest,
     WebAuthTokenResponse,
 )
-from app.services import oauth_service
+from app.services import oauth_service, profile_service
 from app.services.oauth_service import OAuthCallbackJsonError
 
 router = APIRouter(prefix="/auth/oauth", tags=["OAuth"])
@@ -224,7 +224,10 @@ def oauth_exchange(
             _attach_set_cookie(exc, build_clear_exchange_cookie_header(settings))
         raise
 
-    user_public = _to_user_public(user)
+    user_public = _to_user_public(
+        user,
+        profile_completed=profile_service.is_profile_completed(db, user_id=user.id),
+    )
     if client_type == "web":
         response.delete_cookie(
             key=settings.OAUTH_EXCHANGE_COOKIE_NAME,

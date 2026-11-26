@@ -12,7 +12,7 @@ from sqlalchemy import Engine
 from starlette.types import Receive, Scope, Send
 import uvicorn.config
 
-from app.api.routes import auth, health, oauth
+from app.api.routes import auth, health, oauth, profile
 from app.core.config import Settings, get_settings
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import setup_logging
@@ -203,6 +203,7 @@ def create_app(settings: Settings | None = None) -> Folio360FastAPI:
     api_v1_router.include_router(health.router)
     api_v1_router.include_router(auth.router)
     api_v1_router.include_router(oauth.router)
+    api_v1_router.include_router(profile.router)
     application.include_router(api_v1_router)
 
     return application

@@ -223,3 +223,16 @@ def get_current_user(
 ) -> User:
     """Return the authenticated User resolved by get_current_auth_context."""
     return auth_ctx.user
+
+
+def get_current_verified_user(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """Return the authenticated User only when their email address is verified."""
+    if not current_user.is_email_verified:
+        raise auth_error(
+            status_code=status.HTTP_403_FORBIDDEN,
+            code="EMAIL_NOT_VERIFIED",
+            public_message="Email address must be verified before accessing this resource.",
+        )
+    return current_user

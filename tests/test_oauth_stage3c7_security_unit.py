@@ -24,7 +24,7 @@ from app.db.session import get_db
 from app.main import create_app
 from app.models.oauth import OAuthState
 from app.models.user import User
-from app.services import oauth_service
+from app.services import oauth_service, profile_service
 from app.services.oauth_providers import ensure_no_open_db_transaction
 from app.services.oauth_service import (
     OAuthCallbackJsonError,
@@ -141,6 +141,11 @@ def test_cross_site_cookie_topology_attributes(
         oauth_service,
         "exchange_oauth_code",
         lambda db, **kw: (user_obj, "jwt-cs", 900, "refresh-cs", 1209600),
+    )
+    monkeypatch.setattr(
+        profile_service,
+        "is_profile_completed",
+        lambda db, *, user_id: False,
     )
 
     with TestClient(app) as client:
@@ -269,6 +274,11 @@ def test_asgi_middleware_ordering_and_oauth_headers_across_all_status_codes(
         oauth_service,
         "exchange_oauth_code",
         lambda db, **kw: (user_obj, "jwt-mw", 900, "rt-mw", 1209600),
+    )
+    monkeypatch.setattr(
+        profile_service,
+        "is_profile_completed",
+        lambda db, *, user_id: False,
     )
 
     origin_hdr = {"Origin": "https://app.folio360.com"}

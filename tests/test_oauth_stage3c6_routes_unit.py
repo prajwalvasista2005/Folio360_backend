@@ -17,7 +17,7 @@ from app.db.session import get_db
 from app.main import create_app
 from app.models.user import User
 from app.schemas.auth import OAuthExchangeRequest
-from app.services import oauth_service
+from app.services import oauth_service, profile_service
 from app.services.oauth_providers import HttpxJWKClient, OAuthTransactionGuardError
 from app.services.oauth_service import (
     OAuthCallbackJsonError,
@@ -453,6 +453,11 @@ def test_oauth_exchange_csrf_cookie_matrix_500_429_and_me_providers(
         oauth_service,
         "list_user_oauth_providers",
         lambda db, *, user_id: ["github", "google"],
+    )
+    monkeypatch.setattr(
+        profile_service,
+        "is_profile_completed",
+        lambda db, *, user_id: False,
     )
 
     body = {"code": "raw-ex-code", "exchange_code_verifier": verifier}
