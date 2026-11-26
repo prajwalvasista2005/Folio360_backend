@@ -1,6 +1,7 @@
 """Isolated destructive Alembic migration and split-role privilege tests on _test DBs."""
 
 import os
+import uuid
 
 from alembic import command
 import pytest
@@ -21,6 +22,10 @@ ALL_MIGRATED_TABLES: tuple[str, ...] = (
     "oauth_exchange_codes",
     "user_profiles",
     "user_profile_activities",
+    "educations",
+    "documents",
+    "education_documents",
+    "document_analyses",
 )
 
 
@@ -124,7 +129,36 @@ def test_alembic_0001_populated_upgrade_to_head_reversibility_and_schema_check(
         assert stage3c_inspector.has_table("user_profiles") is False
         assert stage3c_inspector.has_table("user_profile_activities") is False
 
-        # Upgrade populated DB to head (0005_add_user_profiles)
+        # Upgrade populated DB to 0005_add_user_profiles (pre-Phase 2 educations)
+        command.upgrade(cfg, "0005_add_user_profiles")
+        phase1_inspector = inspect(migrator_inspect_engine)
+        assert phase1_inspector.has_table("user_profiles") is True
+        assert phase1_inspector.has_table("user_profile_activities") is True
+        assert phase1_inspector.has_table("educations") is False
+
+        # Upgrade populated DB to 0006_add_educations (pre-Stage 4 documents)
+        command.upgrade(cfg, "0006_add_educations")
+        phase2_edu_inspector = inspect(migrator_inspect_engine)
+        assert phase2_edu_inspector.has_table("educations") is True
+        assert phase2_edu_inspector.has_table("documents") is False
+        assert phase2_edu_inspector.has_table("education_documents") is False
+
+        # Upgrade populated DB to 0007_add_documents (Stage 4 baseline)
+        command.upgrade(cfg, "0007_add_documents")
+        stage4_inspector = inspect(migrator_inspect_engine)
+        assert stage4_inspector.has_table("documents") is True
+        assert stage4_inspector.has_table("education_documents") is True
+        assert "storage_state" not in {
+            col["name"] for col in stage4_inspector.get_columns("documents")
+        }
+
+        # Upgrade populated DB to 0008_document_quarantine_scan (pre-Stage 6 AI analyses)
+        command.upgrade(cfg, "0008_document_quarantine_scan")
+        stage5_inspector = inspect(migrator_inspect_engine)
+        assert stage5_inspector.has_table("documents") is True
+        assert stage5_inspector.has_table("document_analyses") is False
+
+        # Upgrade populated DB to head (0009_add_document_analyses)
         command.upgrade(cfg, "head")
         head_inspector = inspect(migrator_inspect_engine)
         assert head_inspector.has_table("users") is True
@@ -136,6 +170,10 @@ def test_alembic_0001_populated_upgrade_to_head_reversibility_and_schema_check(
         assert head_inspector.has_table("oauth_exchange_codes") is True
         assert head_inspector.has_table("user_profiles") is True
         assert head_inspector.has_table("user_profile_activities") is True
+        assert head_inspector.has_table("educations") is True
+        assert head_inspector.has_table("documents") is True
+        assert head_inspector.has_table("education_documents") is True
+        assert head_inspector.has_table("document_analyses") is True
 
         # Verify legacy populated user received exact Rev10 defaults
         with migrator_inspect_engine.connect() as conn:
@@ -597,7 +635,231 @@ def test_alembic_0001_populated_upgrade_to_head_reversibility_and_schema_check(
         assert upa_fks[0]["referred_table"] == "user_profiles"
         assert upa_fks[0]["options"].get("ondelete") == "CASCADE"
 
-        # 5. Reversibility: head -> 0004 -> 0003 -> 0002 -> 0001 -> head -> base -> head -> alembic check
+        # Verify educations schema (Phase 2)
+        edu_cols = {col["name"]: col for col in head_inspector.get_columns("educations")}
+        assert set(edu_cols.keys()) == {
+            "id",
+            "user_id",
+            "institution",
+            "university_or_board",
+            "education_level",
+            "degree",
+            "programme",
+            "branch",
+            "specialization",
+            "country",
+            "state",
+            "start_month",
+            "start_year",
+            "end_month",
+            "end_year",
+            "is_current",
+            "description",
+            "scheme_id",
+            "result_type",
+            "result_value",
+            "result_source",
+            "computed_cgpa",
+            "show_result_publicly",
+            "achievements",
+            "visibility",
+            "created_at",
+            "updated_at",
+        }
+        assert edu_cols["user_id"]["nullable"] is False
+        assert edu_cols["institution"]["nullable"] is False
+        assert edu_cols["degree"]["nullable"] is False
+        assert edu_cols["is_current"]["nullable"] is False
+        assert edu_cols["result_source"]["nullable"] is False
+        assert edu_cols["show_result_publicly"]["nullable"] is False
+        assert edu_cols["achievements"]["nullable"] is False
+        assert edu_cols["visibility"]["nullable"] is False
+        assert head_inspector.get_pk_constraint("educations")["name"] == "pk_educations"
+        edu_checks = {
+            cc["name"] for cc in head_inspector.get_check_constraints("educations")
+        }
+        assert edu_checks == {
+            "ck_educations_institution_valid",
+            "ck_educations_degree_valid",
+            "ck_educations_start_month_range",
+            "ck_educations_end_month_range",
+            "ck_educations_start_year_range",
+            "ck_educations_end_year_range",
+            "ck_educations_start_month_requires_year",
+            "ck_educations_end_month_requires_year",
+            "ck_educations_current_no_end_date",
+            "ck_educations_date_order_valid",
+            "ck_educations_result_source_valid",
+            "ck_educations_visibility_valid",
+            "ck_educations_achievements_array",
+            "ck_educations_computed_cgpa_range",
+        }
+        edu_indexes = {idx["name"] for idx in head_inspector.get_indexes("educations")}
+        assert "ix_educations_user_id" in edu_indexes
+        edu_fks = head_inspector.get_foreign_keys("educations")
+        assert len(edu_fks) == 1
+        assert edu_fks[0]["referred_table"] == "users"
+        assert edu_fks[0]["options"].get("ondelete") == "CASCADE"
+
+        # Verify documents schema (Phase 2 Stage 4 + Stage 5)
+        doc_cols = {col["name"]: col for col in head_inspector.get_columns("documents")}
+        assert set(doc_cols.keys()) == {
+            "id",
+            "user_id",
+            "title",
+            "original_filename",
+            "category",
+            "mime_type",
+            "size_bytes",
+            "page_count",
+            "sha256",
+            "storage_backend",
+            "storage_key",
+            "storage_state",
+            "notes",
+            "processing_status",
+            "scan_attempts",
+            "scan_started_at",
+            "scanned_at",
+            "failure_reason",
+            "show_in_education",
+            "created_at",
+            "updated_at",
+        }
+        assert doc_cols["storage_state"]["nullable"] is False
+        assert doc_cols["scan_attempts"]["nullable"] is False
+        assert doc_cols["scan_started_at"]["nullable"] is True
+        assert doc_cols["scanned_at"]["nullable"] is True
+        assert doc_cols["failure_reason"]["nullable"] is True
+        assert head_inspector.get_pk_constraint("documents")["name"] == "pk_documents"
+        doc_uniques = {uc["name"] for uc in head_inspector.get_unique_constraints("documents")}
+        assert "uq_documents_storage_key" in doc_uniques
+        doc_checks = {cc["name"] for cc in head_inspector.get_check_constraints("documents")}
+        assert doc_checks == {
+            "ck_documents_title_valid",
+            "ck_documents_original_filename_valid",
+            "ck_documents_category_valid",
+            "ck_documents_mime_type_valid",
+            "ck_documents_size_bytes_positive",
+            "ck_documents_page_count_positive",
+            "ck_documents_sha256_hex",
+            "ck_documents_storage_backend_valid",
+            "ck_documents_storage_key_valid",
+            "ck_documents_processing_status_valid",
+            "ck_documents_storage_state_valid",
+            "ck_documents_scan_attempts_non_negative",
+            "ck_documents_failure_reason_valid",
+            "ck_documents_status_storage_consistency",
+        }
+        doc_indexes = {idx["name"] for idx in head_inspector.get_indexes("documents")}
+        assert {
+            "ix_documents_user_id",
+            "ix_documents_user_created",
+            "ix_documents_processing_status",
+        }.issubset(doc_indexes)
+        doc_fks = head_inspector.get_foreign_keys("documents")
+        assert len(doc_fks) == 1
+        assert doc_fks[0]["referred_table"] == "users"
+        assert doc_fks[0]["options"].get("ondelete") == "CASCADE"
+
+        # Verify education_documents schema (Phase 2 Stage 4)
+        ed_cols = {col["name"]: col for col in head_inspector.get_columns("education_documents")}
+        assert set(ed_cols.keys()) == {"education_id", "document_id", "display_order", "created_at"}
+        ed_pk = head_inspector.get_pk_constraint("education_documents")
+        assert ed_pk["name"] == "pk_education_documents"
+        assert ed_pk["constrained_columns"] == ["education_id", "document_id"]
+        ed_checks = {
+            cc["name"] for cc in head_inspector.get_check_constraints("education_documents")
+        }
+        assert ed_checks == {"ck_education_documents_display_order_non_negative"}
+        ed_indexes = {idx["name"] for idx in head_inspector.get_indexes("education_documents")}
+        assert "ix_education_documents_document_id" in ed_indexes
+        ed_fks = {
+            tuple(fk["constrained_columns"]): fk
+            for fk in head_inspector.get_foreign_keys("education_documents")
+        }
+        assert ed_fks[("education_id",)]["referred_table"] == "educations"
+        assert ed_fks[("education_id",)]["options"].get("ondelete") == "CASCADE"
+        assert ed_fks[("document_id",)]["referred_table"] == "documents"
+        assert ed_fks[("document_id",)]["options"].get("ondelete") == "CASCADE"
+
+        # Verify document_analyses schema (Phase 2 Stage 6)
+        da_cols = {col["name"]: col for col in head_inspector.get_columns("document_analyses")}
+        assert set(da_cols.keys()) == {
+            "id",
+            "document_id",
+            "user_id",
+            "status",
+            "document_type",
+            "provider_name",
+            "model_name",
+            "analyzer_version",
+            "attempts",
+            "started_at",
+            "completed_at",
+            "summary",
+            "extracted_data",
+            "confidence",
+            "uncertain_fields",
+            "failure_reason",
+            "created_at",
+            "updated_at",
+        }
+        assert head_inspector.get_pk_constraint("document_analyses")["name"] == "pk_document_analyses"
+        da_uniques = {uc["name"] for uc in head_inspector.get_unique_constraints("document_analyses")}
+        assert "uq_document_analyses_document_id" in da_uniques
+        da_checks = {cc["name"] for cc in head_inspector.get_check_constraints("document_analyses")}
+        assert da_checks == {
+            "ck_document_analyses_status_valid",
+            "ck_document_analyses_document_type_valid",
+            "ck_document_analyses_attempts_non_negative",
+            "ck_document_analyses_confidence_range",
+            "ck_document_analyses_uncertain_fields_array",
+            "ck_document_analyses_failure_reason_valid",
+            "ck_document_analyses_status_result_consistency",
+        }
+        da_indexes = {idx["name"] for idx in head_inspector.get_indexes("document_analyses")}
+        assert {
+            "ix_document_analyses_user_id",
+            "ix_document_analyses_status_updated",
+        }.issubset(da_indexes)
+        da_fks = {
+            tuple(fk["constrained_columns"]): fk
+            for fk in head_inspector.get_foreign_keys("document_analyses")
+        }
+        assert da_fks[("document_id",)]["referred_table"] == "documents"
+        assert da_fks[("document_id",)]["options"].get("ondelete") == "CASCADE"
+        assert da_fks[("user_id",)]["referred_table"] == "users"
+        assert da_fks[("user_id",)]["options"].get("ondelete") == "CASCADE"
+
+        # 5. Reversibility: head -> 0008 -> 0007 -> 0006 -> 0005 -> 0004 -> 0003 -> 0002 -> 0001 -> head -> base -> head -> alembic check
+        command.downgrade(cfg, "0008_document_quarantine_scan")
+        stage5_post_downgrade = inspect(migrator_inspect_engine)
+        assert stage5_post_downgrade.has_table("documents") is True
+        assert stage5_post_downgrade.has_table("document_analyses") is False
+
+        command.downgrade(cfg, "0007_add_documents")
+        stage4_post_downgrade = inspect(migrator_inspect_engine)
+        assert stage4_post_downgrade.has_table("documents") is True
+        assert "storage_state" not in {
+            col["name"] for col in stage4_post_downgrade.get_columns("documents")
+        }
+        assert "ix_documents_processing_status" not in {
+            idx["name"] for idx in stage4_post_downgrade.get_indexes("documents")
+        }
+
+        command.downgrade(cfg, "0006_add_educations")
+        phase2_edu_post_downgrade = inspect(migrator_inspect_engine)
+        assert phase2_edu_post_downgrade.has_table("educations") is True
+        assert phase2_edu_post_downgrade.has_table("documents") is False
+        assert phase2_edu_post_downgrade.has_table("education_documents") is False
+
+        command.downgrade(cfg, "0005_add_user_profiles")
+        phase1_post_downgrade = inspect(migrator_inspect_engine)
+        assert phase1_post_downgrade.has_table("user_profiles") is True
+        assert phase1_post_downgrade.has_table("user_profile_activities") is True
+        assert phase1_post_downgrade.has_table("educations") is False
+
         command.downgrade(cfg, "0004_add_oauth_tables")
         stage3c_post_downgrade = inspect(migrator_inspect_engine)
         assert stage3c_post_downgrade.has_table("oauth_accounts") is True
@@ -692,7 +954,8 @@ def test_split_roles_enforce_dml_only_for_app_and_ddl_for_migrator(
                     "AND tablename IN ('users', 'email_verification_tokens', "
                     "'password_reset_tokens', 'refresh_sessions', "
                     "'oauth_accounts', 'oauth_states', 'oauth_exchange_codes', "
-                    "'user_profiles', 'user_profile_activities')"
+                    "'user_profiles', 'user_profile_activities', 'educations', "
+                    "'documents', 'education_documents', 'document_analyses')"
                 )
             ).all()
             assert dict(owners) == {
@@ -705,6 +968,10 @@ def test_split_roles_enforce_dml_only_for_app_and_ddl_for_migrator(
                 "oauth_exchange_codes": migrator_role,
                 "user_profiles": migrator_role,
                 "user_profile_activities": migrator_role,
+                "educations": migrator_role,
+                "documents": migrator_role,
+                "education_documents": migrator_role,
+                "document_analyses": migrator_role,
             }
     finally:
         migrator_engine.dispose()
@@ -804,6 +1071,52 @@ def test_split_roles_enforce_dml_only_for_app_and_ddl_for_migrator(
             ),
             {"pid": profile_id},
         )
+        edu_id = conn.execute(
+            text(
+                "INSERT INTO educations (user_id, institution, degree) "
+                "VALUES (:uid, 'DML University', 'B.E.') RETURNING id"
+            ),
+            {"uid": user_id},
+        ).scalar_one()
+        doc_id = conn.execute(
+            text(
+                "INSERT INTO documents "
+                "(user_id, title, original_filename, category, mime_type, size_bytes, "
+                "sha256, storage_backend, storage_key) "
+                "VALUES (:uid, 'DML Doc', 'doc.pdf', 'marksheet', 'application/pdf', 128, "
+                "repeat('a', 64), 'local', :skey) RETURNING id"
+            ),
+            {"uid": user_id, "skey": f"{user_id}/{uuid.uuid4()}"},
+        ).scalar_one()
+        conn.execute(
+            text(
+                "INSERT INTO education_documents (education_id, document_id, display_order) "
+                "VALUES (:eid, :did, 0)"
+            ),
+            {"eid": edu_id, "did": doc_id},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO document_analyses "
+                "(document_id, user_id, status, provider_name, model_name) "
+                "VALUES (:did, :uid, 'pending', 'mock', 'mock-academic-v1')"
+            ),
+            {"did": doc_id, "uid": user_id},
+        )
+        conn.execute(
+            text("UPDATE educations SET branch = 'CS' WHERE id = :eid"),
+            {"eid": edu_id},
+        )
+        conn.execute(
+            text("DELETE FROM document_analyses WHERE document_id = :did"),
+            {"did": doc_id},
+        )
+        conn.execute(
+            text("DELETE FROM education_documents WHERE education_id = :eid"),
+            {"eid": edu_id},
+        )
+        conn.execute(text("DELETE FROM documents WHERE id = :did"), {"did": doc_id})
+        conn.execute(text("DELETE FROM educations WHERE id = :eid"), {"eid": edu_id})
         cnt = conn.execute(
             text("SELECT COUNT(*) FROM users WHERE id = :uid"),
             {"uid": user_id},
@@ -827,9 +1140,16 @@ def test_split_roles_enforce_dml_only_for_app_and_ddl_for_migrator(
         "DROP TABLE public.oauth_exchange_codes",
         "DROP TABLE public.user_profile_activities",
         "DROP TABLE public.user_profiles",
+        "DROP TABLE public.educations",
+        "DROP TABLE public.education_documents",
+        "DROP TABLE public.document_analyses",
+        "DROP TABLE public.documents",
         "TRUNCATE TABLE public.users CASCADE",
         "TRUNCATE TABLE public.oauth_states",
         "TRUNCATE TABLE public.user_profiles CASCADE",
+        "TRUNCATE TABLE public.educations CASCADE",
+        "TRUNCATE TABLE public.document_analyses CASCADE",
+        "TRUNCATE TABLE public.documents CASCADE",
     ):
         with pytest.raises(ProgrammingError):
             with db_engine.begin() as conn:

@@ -395,11 +395,15 @@ def test_alembic_0004_revision_chain_and_mock_ddl_parity_with_metadata() -> None
     script = ScriptDirectory.from_config(cfg)
 
     heads = script.get_heads()
-    assert heads == ["0005_add_user_profiles"]
+    assert heads == ["0009_add_document_analyses"]
 
     revs = list(script.walk_revisions("base", "head"))
     rev_ids = [r.revision for r in revs]
     assert rev_ids == [
+        "0009_add_document_analyses",
+        "0008_document_quarantine_scan",
+        "0007_add_documents",
+        "0006_add_educations",
         "0005_add_user_profiles",
         "0004_add_oauth_tables",
         "0003_add_password_reset_tokens",

@@ -1,5 +1,6 @@
 # Core Framework & ASGI Server
 fastapi>=0.115.0
+python-multipart>=0.0.20
 uvicorn[standard]>=0.32.0
 
 # Database & ORM (Synchronous SQLAlchemy 2.x & psycopg 3)
@@ -16,6 +17,7 @@ argon2-cffi>=23.1.0
 pyjwt[crypto]>=2.10.0
 
 # HTTP Client & External Integrations
+boto3>=1.35.0
 httpx>=0.28.0
 resend>=2.6.0
 

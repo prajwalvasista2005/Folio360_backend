@@ -27,6 +27,7 @@ from app.core.uri_policy import (
 OAUTH_EXCHANGE_CODE_EXPIRE_SECONDS = 60
 DEFAULT_MOBILE_OAUTH_REDIRECT_URI = "folio360://auth/callback"
 RFC6265_COOKIE_NAME_RE = re.compile(r"\A[!#$%&'*+\-.^_`|~0-9A-Za-z]+\Z")
+DOCUMENT_NAMESPACE_RE = re.compile(r"\A[a-z0-9][a-z0-9_-]{0,31}\Z")
 
 
 def _validate_postgres_psycopg_url(
@@ -249,6 +250,51 @@ class Settings(BaseSettings):
     GITHUB_EMAILS_PER_PAGE: int = Field(default=100, ge=1, le=100)
     GITHUB_EMAILS_MAX_PAGES: int = Field(default=10, ge=1, le=20)
 
+    # Phase 2 Stage 4: Document Vault & Storage Configuration
+    STORAGE_BACKEND: Literal["local", "s3"] = "local"
+    DOCUMENT_LOCAL_STORAGE_DIR: str = "/tmp/folio360_documents"
+    DOCUMENT_MAX_SIZE_BYTES: int = Field(
+        default=10 * 1024 * 1024,
+        ge=1024,
+        le=50 * 1024 * 1024,
+    )
+    DOCUMENT_SIGNED_URL_TTL_SECONDS: int = Field(default=300, ge=30, le=3600)
+    DOCUMENT_SIGNING_SECRET: SecretStr | None = None
+    S3_ENDPOINT_URL: str | None = None
+    S3_BUCKET_NAME: str | None = None
+    S3_REGION: str = "auto"
+    S3_ACCESS_KEY_ID: SecretStr | None = None
+    S3_SECRET_ACCESS_KEY: SecretStr | None = None
+    S3_FORCE_PATH_STYLE: bool = False
+
+    # Phase 2 Stage 5: File Validation, Quarantine & Malware Scanning
+    DOCUMENT_QUARANTINE_NAMESPACE: str = "quarantine"
+    DOCUMENT_TRUSTED_NAMESPACE: str = "trusted"
+    MALWARE_SCANNER_BACKEND: Literal["clamav", "mock"] = "clamav"
+    CLAMAV_HOST: str = "127.0.0.1"
+    CLAMAV_PORT: int = Field(default=3310, ge=1, le=65535)
+    CLAMAV_UNIX_SOCKET: str | None = None
+    DOCUMENT_SCAN_TIMEOUT_SECONDS: float = Field(default=10.0, gt=0.5, le=60.0)
+    DOCUMENT_SCAN_PROCESSING_MODE: Literal["inline", "deferred"] = "inline"
+    DOCUMENT_SCAN_MAX_RETRIES: int = Field(default=3, ge=1, le=10)
+    DOCUMENT_SCAN_STALE_SECONDS: int = Field(default=300, ge=30, le=3600)
+    DOCUMENT_REJECTED_RETENTION_POLICY: Literal["delete", "retain_quarantine"] = "delete"
+
+    # Phase 2 Stage 6: AI Analyzer
+    AI_ANALYZER_PROVIDER: Literal["none", "gemini", "mock"] = "none"
+    AI_ANALYZER_API_KEY: SecretStr | None = None
+    AI_ANALYZER_MODEL: str = "gemini-2.5-flash"
+    AI_ANALYZER_BASE_URL: str = "https://generativelanguage.googleapis.com"
+    AI_ANALYZER_TIMEOUT_SECONDS: float = Field(default=30.0, gt=1.0, le=120.0)
+    AI_ANALYZER_MAX_RETRIES: int = Field(default=3, ge=1, le=10)
+    AI_ANALYZER_MAX_INPUT_BYTES: int = Field(
+        default=10 * 1024 * 1024,
+        ge=1024,
+        le=50 * 1024 * 1024,
+    )
+    AI_ANALYZER_PROCESSING_MODE: Literal["inline", "deferred"] = "inline"
+    AI_ANALYZER_STALE_SECONDS: int = Field(default=300, ge=30, le=3600)
+
     @property
     def oauth_enabled(self) -> bool:
         """Return True when at least one OAuth provider is configured."""
@@ -438,11 +484,15 @@ class Settings(BaseSettings):
         "GITHUB_CLIENT_SECRET",
         "OAUTH_PKCE_ENCRYPTION_KEY",
         "OAUTH_PKCE_ENCRYPTION_KEY_PREVIOUS",
+        "DOCUMENT_SIGNING_SECRET",
+        "S3_ACCESS_KEY_ID",
+        "S3_SECRET_ACCESS_KEY",
+        "AI_ANALYZER_API_KEY",
         mode="before",
     )
     @classmethod
     def normalize_optional_oauth_secret(cls, value: Any) -> SecretStr | None:
-        """Normalize blank OAuth secrets to None without echoing secret values."""
+        """Normalize blank optional secrets to None without echoing secret values."""
         if value is None:
             return None
         if isinstance(value, SecretStr):
@@ -450,10 +500,67 @@ class Settings(BaseSettings):
         elif isinstance(value, str):
             raw = value
         else:
-            raise ValueError("OAuth secret must be a string or None")
+            raise ValueError("Secret setting must be a string or None")
         if not raw.strip():
             return None
         return SecretStr(raw)
+
+    @field_validator("S3_ENDPOINT_URL", "S3_BUCKET_NAME", mode="before")
+    @classmethod
+    def normalize_optional_s3_strings(cls, value: Any) -> str | None:
+        """Normalize blank optional S3 settings to None."""
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("S3 setting must be a string or None")
+        cleaned = value.strip().rstrip("/")
+        return cleaned or None
+
+    @field_validator("DOCUMENT_LOCAL_STORAGE_DIR", "S3_REGION", "CLAMAV_HOST", "AI_ANALYZER_MODEL")
+    @classmethod
+    def validate_non_empty_storage_setting(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("Configuration value must not be blank")
+        return cleaned
+
+    @field_validator("AI_ANALYZER_BASE_URL")
+    @classmethod
+    def validate_ai_analyzer_base_url(cls, value: str) -> str:
+        """Validate AI_ANALYZER_BASE_URL as a clean http/https base URL without credentials."""
+        cleaned = value.strip().rstrip("/")
+        if not cleaned or any(ch.isspace() for ch in cleaned):
+            raise ValueError("AI_ANALYZER_BASE_URL must not be empty or contain whitespace")
+        parts = urlsplit(cleaned)
+        if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
+            raise ValueError("AI_ANALYZER_BASE_URL must use http:// or https:// with a host")
+        if parts.username is not None or parts.password is not None:
+            raise ValueError("AI_ANALYZER_BASE_URL must not contain credentials")
+        if parts.query or parts.fragment:
+            raise ValueError("AI_ANALYZER_BASE_URL must not contain query or fragment")
+        return cleaned
+
+    @field_validator("DOCUMENT_QUARANTINE_NAMESPACE", "DOCUMENT_TRUSTED_NAMESPACE")
+    @classmethod
+    def validate_document_storage_namespace(cls, value: str) -> str:
+        """Validate safe lowercase storage namespace names without slashes or traversal."""
+        cleaned = value.strip().lower()
+        if not DOCUMENT_NAMESPACE_RE.fullmatch(cleaned):
+            raise ValueError(
+                "Document storage namespace must match ^[a-z0-9][a-z0-9_-]{0,31}$"
+            )
+        return cleaned
+
+    @field_validator("CLAMAV_UNIX_SOCKET", mode="before")
+    @classmethod
+    def normalize_clamav_unix_socket(cls, value: Any) -> str | None:
+        """Normalize blank CLAMAV_UNIX_SOCKET strings to None."""
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("CLAMAV_UNIX_SOCKET must be a string or None")
+        cleaned = value.strip()
+        return cleaned or None
 
     @field_validator("API_V1_PREFIX")
     @classmethod
@@ -765,6 +872,11 @@ class Settings(BaseSettings):
                         "member of CORS_ORIGINS when OAuth is enabled (D19)"
                     )
 
+        if self.DOCUMENT_QUARANTINE_NAMESPACE == self.DOCUMENT_TRUSTED_NAMESPACE:
+            raise ValueError(
+                "DOCUMENT_QUARANTINE_NAMESPACE and DOCUMENT_TRUSTED_NAMESPACE must be distinct"
+            )
+
         return self
 
     def validate_runtime_requirements(self) -> None:
@@ -884,6 +996,43 @@ class Settings(BaseSettings):
                     raise RuntimeError(
                         f"TRUSTED_PROXY_IPS entry {entry!r} is not a valid IP address or CIDR"
                     ) from exc
+
+        if self.STORAGE_BACKEND == "s3":
+            if not self.S3_BUCKET_NAME:
+                raise RuntimeError("S3_BUCKET_NAME must be configured when STORAGE_BACKEND is 's3'")
+            if self.S3_ACCESS_KEY_ID is None or self.S3_SECRET_ACCESS_KEY is None:
+                raise RuntimeError(
+                    "S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY must be configured when STORAGE_BACKEND is 's3'"
+                )
+            if self.S3_ENDPOINT_URL is not None:
+                endpoint_parts = urlsplit(self.S3_ENDPOINT_URL)
+                if endpoint_parts.scheme.lower() != "https" or not endpoint_parts.hostname:
+                    raise RuntimeError(
+                        "S3_ENDPOINT_URL must be an https:// URL in production"
+                    )
+
+        if self.MALWARE_SCANNER_BACKEND != "clamav":
+            raise RuntimeError(
+                "MALWARE_SCANNER_BACKEND must be 'clamav' when ENVIRONMENT is production or staging"
+            )
+        if self.CLAMAV_UNIX_SOCKET is None and not self.CLAMAV_HOST.strip():
+            raise RuntimeError(
+                "CLAMAV_HOST or CLAMAV_UNIX_SOCKET must be configured for ClamAV scanning"
+            )
+
+        if self.AI_ANALYZER_PROVIDER == "mock":
+            raise RuntimeError(
+                "AI_ANALYZER_PROVIDER='mock' is forbidden when ENVIRONMENT is production or staging"
+            )
+        if self.AI_ANALYZER_PROVIDER == "gemini":
+            if self.AI_ANALYZER_API_KEY is None:
+                raise RuntimeError(
+                    "AI_ANALYZER_API_KEY must be configured when AI_ANALYZER_PROVIDER is 'gemini'"
+                )
+            if urlsplit(self.AI_ANALYZER_BASE_URL).scheme.lower() != "https":
+                raise RuntimeError(
+                    "AI_ANALYZER_BASE_URL must use https:// in production or staging"
+                )
 
 
 @lru_cache

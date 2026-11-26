@@ -37,7 +37,7 @@ KEY_VALUE_PATTERN = re.compile(
     r"new_password|current_password|password|"
     r"client_secret|jwt_secret_key|oauth_pkce_encryption_key_previous|oauth_pkce_encryption_key|secret|"
     r"access_token|refresh_token|verification_token|reset_token|id_token|token_hash|token|"
-    r"resend_api_key|api_key|"
+    r"ai_analyzer_api_key|x-goog-api-key|resend_api_key|api_key|"
     r"pkce_verifier_encrypted|pkce_verifier|exchange_code_verifier|code_verifier|"
     r"exchange_code|authorization_code|oauth_code|oauth_state|(?<![A-Za-z0-9_-])oauth_nonce|(?<![A-Za-z0-9_-])nonce|"
     r"folio360_oauth_binding|oauth_binding|folio360_oauth_exchange|oauth_exchange|folio360_refresh_token"
