@@ -26,6 +26,10 @@ ALL_MIGRATED_TABLES: tuple[str, ...] = (
     "documents",
     "education_documents",
     "document_analyses",
+    "projects",
+    "project_images",
+    "github_connections",
+    "github_oauth_states",
 )
 
 
@@ -173,7 +177,9 @@ def test_alembic_0001_populated_upgrade_to_head_reversibility_and_schema_check(
         assert head_inspector.has_table("educations") is True
         assert head_inspector.has_table("documents") is True
         assert head_inspector.has_table("education_documents") is True
-        assert head_inspector.has_table("document_analyses") is True
+        assert head_inspector.get_table_names() is not None
+        for tbl in ALL_MIGRATED_TABLES:
+            assert head_inspector.has_table(tbl) is True
 
         # Verify legacy populated user received exact Rev10 defaults
         with migrator_inspect_engine.connect() as conn:
@@ -955,7 +961,8 @@ def test_split_roles_enforce_dml_only_for_app_and_ddl_for_migrator(
                     "'password_reset_tokens', 'refresh_sessions', "
                     "'oauth_accounts', 'oauth_states', 'oauth_exchange_codes', "
                     "'user_profiles', 'user_profile_activities', 'educations', "
-                    "'documents', 'education_documents', 'document_analyses')"
+                    "'documents', 'education_documents', 'document_analyses', "
+                    "'projects', 'project_images', 'github_connections', 'github_oauth_states')"
                 )
             ).all()
             assert dict(owners) == {
@@ -972,6 +979,10 @@ def test_split_roles_enforce_dml_only_for_app_and_ddl_for_migrator(
                 "documents": migrator_role,
                 "education_documents": migrator_role,
                 "document_analyses": migrator_role,
+                "projects": migrator_role,
+                "project_images": migrator_role,
+                "github_connections": migrator_role,
+                "github_oauth_states": migrator_role,
             }
     finally:
         migrator_engine.dispose()

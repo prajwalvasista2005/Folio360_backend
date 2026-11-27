@@ -19,7 +19,9 @@ from app.core.exceptions import (
     ResourceNotFoundError,
     ValidationAppError,
 )
+from app.models.certificate import AchievementDocument, Certificate
 from app.models.document import DOCUMENT_CATEGORIES, Document, EducationDocument
+from app.models.experience import ExperienceDocument
 from app.schemas.document import (
     DocumentCategory,
     DocumentMimeType,
@@ -187,7 +189,14 @@ def _load_document_with_links(
         .options(
             selectinload(Document.education_links).selectinload(
                 EducationDocument.education
-            )
+            ),
+            selectinload(Document.certificates),
+            selectinload(Document.achievement_links).selectinload(
+                AchievementDocument.achievement
+            ),
+            selectinload(Document.experience_links).selectinload(
+                ExperienceDocument.experience
+            ),
         )
         .where(*conditions)
     )
@@ -668,7 +677,14 @@ def list_documents(
         .options(
             selectinload(Document.education_links).selectinload(
                 EducationDocument.education
-            )
+            ),
+            selectinload(Document.certificates),
+            selectinload(Document.achievement_links).selectinload(
+                AchievementDocument.achievement
+            ),
+            selectinload(Document.experience_links).selectinload(
+                ExperienceDocument.experience
+            ),
         )
         .where(*conditions)
         .order_by(Document.created_at.desc(), Document.id.desc())
@@ -895,18 +911,40 @@ def delete_document(
             error_code=_NOT_FOUND_CODE,
         )
 
-    link_count = int(
+    edu_link_count = int(
         db.execute(
             select(func.count(EducationDocument.education_id)).where(
                 EducationDocument.document_id == document_id
             )
         ).scalar_one()
     )
+    cert_link_count = int(
+        db.execute(
+            select(func.count(Certificate.id)).where(
+                Certificate.document_id == document_id
+            )
+        ).scalar_one()
+    )
+    ach_link_count = int(
+        db.execute(
+            select(func.count(AchievementDocument.achievement_id)).where(
+                AchievementDocument.document_id == document_id
+            )
+        ).scalar_one()
+    )
+    exp_link_count = int(
+        db.execute(
+            select(func.count(ExperienceDocument.experience_id)).where(
+                ExperienceDocument.document_id == document_id
+            )
+        ).scalar_one()
+    )
+    link_count = edu_link_count + cert_link_count + ach_link_count + exp_link_count
     if link_count > 0 and not force:
         raise AppException(
-            message="Document is attached to one or more education records",
+            message="Document is attached to one or more records",
             status_code=status.HTTP_409_CONFLICT,
-            public_message="Document is attached to an education record. Unlink it or confirm forced deletion.",
+            public_message="Document is attached to an education, certificate, achievement, or experience record. Unlink it or confirm forced deletion.",
             details={"linked_count": link_count},
             error_code="DOCUMENT_IN_USE",
         )

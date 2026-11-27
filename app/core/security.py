@@ -486,3 +486,76 @@ def decrypt_pkce_verifier_for_settings(
         now=now,
         state_expire_minutes=settings.OAUTH_STATE_EXPIRE_MINUTES,
     )
+
+
+def _resolve_github_token_keys(settings: Settings) -> tuple[bytes, bytes | None]:
+    """Resolve primary (and optional previous) 32-byte AES-256 keys for GitHub access tokens."""
+    if settings.OAUTH_PKCE_ENCRYPTION_KEY is not None:
+        return load_pkce_encryption_keys(settings)
+    if settings.ENVIRONMENT in {"production", "staging"}:
+        raise RuntimeError(
+            "OAUTH_PKCE_ENCRYPTION_KEY must be configured to encrypt GitHub tokens in production"
+        )
+    secret = _require_jwt_secret(settings)
+    derived = hashlib.sha256(f"{secret}:github_portfolio_token".encode("utf-8")).digest()
+    return derived, None
+
+
+def encrypt_github_access_token(
+    access_token: str,
+    *,
+    user_id: uuid.UUID,
+    settings: Settings,
+) -> str:
+    """Encrypt a GitHub OAuth access token with AES-256-GCM bound to user_id AAD."""
+    cleaned = access_token.strip()
+    if not cleaned:
+        raise ValueError("GitHub access token must not be blank")
+    primary_key, _ = _resolve_github_token_keys(settings)
+    aad = f"github_connection:{user_id}".encode("utf-8")
+    nonce = os.urandom(AES_GCM_NONCE_BYTES)
+    ct_with_tag = AESGCM(primary_key).encrypt(nonce, cleaned.encode("utf-8"), aad)
+    encoded = base64.urlsafe_b64encode(nonce + ct_with_tag).rstrip(b"=").decode("ascii")
+    return f"{PKCE_CIPHERTEXT_VERSION_PREFIX}{encoded}"
+
+
+def decrypt_github_access_token(
+    ciphertext: str,
+    *,
+    user_id: uuid.UUID,
+    settings: Settings,
+) -> str:
+    """Decrypt a stored 'v1:' GitHub OAuth access token bound to user_id AAD."""
+    if not isinstance(ciphertext, str) or not ciphertext.startswith(PKCE_CIPHERTEXT_VERSION_PREFIX):
+        raise PKCEDecryptionError("Unsupported GitHub token ciphertext version")
+    b64_payload = ciphertext[len(PKCE_CIPHERTEXT_VERSION_PREFIX) :]
+    if not b64_payload or not _CANONICAL_UNPADDED_B64URL_RE.fullmatch(b64_payload):
+        raise PKCEDecryptionError("Malformed GitHub token ciphertext encoding")
+    padding = "=" * (-len(b64_payload) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(f"{b64_payload}{padding}".encode("ascii"))
+    except (binascii.Error, ValueError):
+        raise PKCEDecryptionError("Invalid GitHub token ciphertext Base64url") from None
+    if len(raw) < MIN_PKCE_DECODED_CIPHERTEXT_BYTES:
+        raise PKCEDecryptionError("GitHub token ciphertext payload is too short")
+
+    primary_key, previous_key = _resolve_github_token_keys(settings)
+    aad = f"github_connection:{user_id}".encode("utf-8")
+    nonce = raw[:AES_GCM_NONCE_BYTES]
+    ct_with_tag = raw[AES_GCM_NONCE_BYTES:]
+
+    try:
+        plaintext_bytes = AESGCM(primary_key).decrypt(nonce, ct_with_tag, aad)
+    except InvalidTag:
+        if previous_key is not None and previous_key != primary_key:
+            try:
+                plaintext_bytes = AESGCM(previous_key).decrypt(nonce, ct_with_tag, aad)
+            except InvalidTag:
+                raise PKCEDecryptionError("GitHub token decryption failed") from None
+        else:
+            raise PKCEDecryptionError("GitHub token decryption failed") from None
+
+    token = plaintext_bytes.decode("utf-8").strip()
+    if not token:
+        raise PKCEDecryptionError("Decrypted GitHub token is empty")
+    return token

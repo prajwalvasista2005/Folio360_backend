@@ -34,7 +34,7 @@ COOKIE_PATTERN = re.compile(
 # Ordered with longer composite names before shorter prefixes.
 KEY_VALUE_PATTERN = re.compile(
     r'(?i)(["\']?(?:'
-    r"new_password|current_password|password|"
+    r"new_password|current_password|smtp_password|password|"
     r"client_secret|jwt_secret_key|oauth_pkce_encryption_key_previous|oauth_pkce_encryption_key|secret|"
     r"access_token|refresh_token|verification_token|reset_token|id_token|token_hash|token|"
     r"ai_analyzer_api_key|x-goog-api-key|resend_api_key|api_key|"

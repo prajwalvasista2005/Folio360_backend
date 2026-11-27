@@ -12,7 +12,22 @@ from sqlalchemy import Engine
 from starlette.types import Receive, Scope, Send
 import uvicorn.config
 
-from app.api.routes import auth, document_analysis, documents, education, health, oauth, profile
+from app.api.routes import (
+    achievements,
+    auth,
+    certificates,
+    document_analysis,
+    documents,
+    education,
+    experience,
+    github,
+    health,
+    oauth,
+    profile,
+    projects,
+    public,
+    skills,
+)
 from app.core.config import Settings, get_settings
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import setup_logging
@@ -205,8 +220,15 @@ def create_app(settings: Settings | None = None) -> Folio360FastAPI:
     api_v1_router.include_router(oauth.router)
     api_v1_router.include_router(profile.router)
     api_v1_router.include_router(education.router)
+    api_v1_router.include_router(projects.router)
+    api_v1_router.include_router(github.router)
+    api_v1_router.include_router(public.router)
     api_v1_router.include_router(documents.router)
     api_v1_router.include_router(document_analysis.router)
+    api_v1_router.include_router(skills.router)
+    api_v1_router.include_router(certificates.router)
+    api_v1_router.include_router(achievements.router)
+    api_v1_router.include_router(experience.router)
     application.include_router(api_v1_router)
 
     return application

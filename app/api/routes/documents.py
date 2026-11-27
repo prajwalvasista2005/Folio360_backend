@@ -48,6 +48,34 @@ def _to_document_response(doc: Document) -> DocumentResponse:
                     label=label,
                 )
             )
+    for cert in doc.certificates:
+        attached_to.append(
+            DocumentAttachedToItem(
+                entity_type="certificate",
+                entity_id=cert.id,
+                label=f"{cert.name} · {cert.issuer}",
+            )
+        )
+    for link in doc.achievement_links:
+        ach = link.achievement
+        if ach is not None:
+            attached_to.append(
+                DocumentAttachedToItem(
+                    entity_type="achievement",
+                    entity_id=ach.id,
+                    label=ach.title,
+                )
+            )
+    for link in doc.experience_links:
+        exp = link.experience
+        if exp is not None:
+            attached_to.append(
+                DocumentAttachedToItem(
+                    entity_type="experience",
+                    entity_id=exp.id,
+                    label=f"{exp.role} · {exp.organization}",
+                )
+            )
     return DocumentResponse(
         id=doc.id,
         user_id=doc.user_id,

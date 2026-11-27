@@ -214,7 +214,7 @@ class Settings(BaseSettings):
     REFRESH_COOKIE_SAMESITE: Literal["lax", "strict", "none"] = "lax"
     REFRESH_COOKIE_DOMAIN: str | None = None
 
-    # Stage 3A: Email Verification, Resend & Frontend Return Configuration
+    # Stage 3A: Email Verification, SMTP Delivery & Frontend Return Configuration
     FRONTEND_BASE_URL: str = "http://localhost:5173"
     EMAIL_VERIFICATION_MOBILE_LOGIN_URIS: list[str] = ["folio360://auth/login"]
     EMAIL_VERIFICATION_EXPIRE_HOURS: int = Field(default=24, ge=1, le=72)
@@ -223,7 +223,10 @@ class Settings(BaseSettings):
     EMAIL_FAILED_RETRY_BACKOFF_SECONDS: int = Field(default=10, ge=1, le=300)
     EMAIL_PENDING_STALE_SECONDS: int = Field(default=30, ge=5, le=600)
     EMAIL_SEND_TIMEOUT_SECONDS: float = Field(default=5.0, ge=1.0, le=15.0)
-    RESEND_API_KEY: SecretStr | None = None
+    SMTP_HOST: str = "smtp.gmail.com"
+    SMTP_PORT: int = Field(default=587, ge=1, le=65535)
+    SMTP_USER: str | None = None
+    SMTP_PASSWORD: SecretStr | None = None
     EMAIL_FROM_ADDRESS: str = "no-reply@folio360.local"
     PASSWORD_RESET_EXPIRE_MINUTES: int = Field(default=30, ge=5, le=120)
 
@@ -249,6 +252,15 @@ class Settings(BaseSettings):
     OAUTH_HTTP_TIMEOUT_SECONDS: float = Field(default=5.0, ge=1.0, le=15.0)
     GITHUB_EMAILS_PER_PAGE: int = Field(default=100, ge=1, le=100)
     GITHUB_EMAILS_MAX_PAGES: int = Field(default=10, ge=1, le=20)
+    # Phase 3: Projects Portfolio & Separate GitHub Integration
+    GITHUB_PORTFOLIO_CLIENT_ID: str | None = None
+    GITHUB_PORTFOLIO_CLIENT_SECRET: SecretStr | None = None
+    GITHUB_PORTFOLIO_SCOPE: str = "read:user repo"
+    PROJECT_IMAGE_MAX_SIZE_BYTES: int = Field(
+        default=5 * 1024 * 1024,
+        ge=1024,
+        le=20 * 1024 * 1024,
+    )
 
     # Phase 2 Stage 4: Document Vault & Storage Configuration
     STORAGE_BACKEND: Literal["local", "s3"] = "local"
@@ -468,7 +480,7 @@ class Settings(BaseSettings):
             allow_empty_string=True,
         )
 
-    @field_validator("GOOGLE_CLIENT_ID", "GITHUB_CLIENT_ID", mode="before")
+    @field_validator("GOOGLE_CLIENT_ID", "GITHUB_CLIENT_ID", "GITHUB_PORTFOLIO_CLIENT_ID", mode="before")
     @classmethod
     def normalize_optional_provider_client_id(cls, value: Any) -> str | None:
         """Normalize empty or whitespace-only OAuth client IDs to None."""
@@ -480,8 +492,10 @@ class Settings(BaseSettings):
         return stripped or None
 
     @field_validator(
+        "SMTP_PASSWORD",
         "GOOGLE_CLIENT_SECRET",
         "GITHUB_CLIENT_SECRET",
+        "GITHUB_PORTFOLIO_CLIENT_SECRET",
         "OAUTH_PKCE_ENCRYPTION_KEY",
         "OAUTH_PKCE_ENCRYPTION_KEY_PREVIOUS",
         "DOCUMENT_SIGNING_SECRET",
@@ -516,7 +530,7 @@ class Settings(BaseSettings):
         cleaned = value.strip().rstrip("/")
         return cleaned or None
 
-    @field_validator("DOCUMENT_LOCAL_STORAGE_DIR", "S3_REGION", "CLAMAV_HOST", "AI_ANALYZER_MODEL")
+    @field_validator("DOCUMENT_LOCAL_STORAGE_DIR", "S3_REGION", "CLAMAV_HOST", "AI_ANALYZER_MODEL", "GITHUB_PORTFOLIO_SCOPE")
     @classmethod
     def validate_non_empty_storage_setting(cls, value: str) -> str:
         cleaned = value.strip()
@@ -813,6 +827,10 @@ class Settings(BaseSettings):
             raise ValueError(
                 "GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET must both be configured or both unset"
             )
+        if bool(self.GITHUB_PORTFOLIO_CLIENT_ID) != bool(self.GITHUB_PORTFOLIO_CLIENT_SECRET):
+            raise ValueError(
+                "GITHUB_PORTFOLIO_CLIENT_ID and GITHUB_PORTFOLIO_CLIENT_SECRET must both be configured or both unset"
+            )
 
         if self.OAUTH_PKCE_ENCRYPTION_KEY is not None:
             decode_aes256_base64url_key(
@@ -900,8 +918,15 @@ class Settings(BaseSettings):
         if not self.JWT_ISSUER.strip() or not self.JWT_AUDIENCE.strip():
             raise RuntimeError("JWT_ISSUER and JWT_AUDIENCE must be non-empty in production")
 
-        if self.RESEND_API_KEY is None or not self.RESEND_API_KEY.get_secret_value().strip():
-            raise RuntimeError("RESEND_API_KEY must be configured in production")
+        if (
+            not self.SMTP_HOST.strip()
+            or not (self.SMTP_USER or "").strip()
+            or self.SMTP_PASSWORD is None
+            or not self.SMTP_PASSWORD.get_secret_value().strip()
+        ):
+            raise RuntimeError(
+                "SMTP_HOST, SMTP_USER, and SMTP_PASSWORD must be configured in production"
+            )
         _validate_production_email_from_address(self.EMAIL_FROM_ADDRESS)
 
         frontend_parts = urlsplit(self.FRONTEND_BASE_URL)
@@ -954,6 +979,11 @@ class Settings(BaseSettings):
             canonicalize_mobile_login_allowlist(
                 self.EMAIL_VERIFICATION_MOBILE_LOGIN_URIS,
                 environment="production",
+            )
+
+        if self.GITHUB_PORTFOLIO_CLIENT_ID and self.OAUTH_PKCE_ENCRYPTION_KEY is None:
+            raise RuntimeError(
+                "OAUTH_PKCE_ENCRYPTION_KEY must be configured in production when GITHUB_PORTFOLIO_CLIENT_ID is set"
             )
 
         if self.oauth_enabled:

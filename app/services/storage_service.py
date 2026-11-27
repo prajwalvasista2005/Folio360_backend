@@ -163,6 +163,44 @@ def verify_local_content_token(
     return hmac.compare_digest(sig_b64, expected_b64)
 
 
+def generate_scoped_content_token(
+    *,
+    scope: str,
+    resource_id: uuid.UUID,
+    expires_at_ts: int,
+    settings: Settings,
+) -> str:
+    """Generate a short-lived HMAC-SHA256 token bound to a storage resource scope and ID."""
+    secret = _resolve_signing_secret(settings)
+    payload = f"{scope}:{resource_id}:{expires_at_ts}".encode("utf-8")
+    digest = hmac.new(secret, payload, hashlib.sha256).digest()
+    sig_b64 = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    return f"{expires_at_ts}.{sig_b64}"
+
+
+def verify_scoped_content_token(
+    token: str,
+    *,
+    scope: str,
+    resource_id: uuid.UUID,
+    settings: Settings,
+) -> bool:
+    """Verify HMAC signature and expiry of a scoped content access token."""
+    if not isinstance(token, str) or "." not in token:
+        return False
+    exp_str, sig_b64 = token.split(".", 1)
+    if not exp_str.isdigit() or not sig_b64:
+        return False
+    expires_at_ts = int(exp_str)
+    if expires_at_ts < int(time.time()):
+        return False
+    secret = _resolve_signing_secret(settings)
+    payload = f"{scope}:{resource_id}:{expires_at_ts}".encode("utf-8")
+    expected_digest = hmac.new(secret, payload, hashlib.sha256).digest()
+    expected_b64 = base64.urlsafe_b64encode(expected_digest).decode("ascii").rstrip("=")
+    return hmac.compare_digest(sig_b64, expected_b64)
+
+
 class StorageBackend(Protocol):
     """Abstract interface for private document binary storage."""
 

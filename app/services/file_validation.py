@@ -1,12 +1,14 @@
 """Magic-byte sniffing and bounded structural validation for Document Vault uploads."""
 
-from typing import get_args
+from typing import Literal, get_args
 import zlib
 
 from fastapi import status
 
 from app.core.exceptions import AppException, ValidationAppError
 from app.schemas.document import DocumentMimeType
+
+ProjectImageMimeType = Literal["image/jpeg", "image/png", "image/webp"]
 
 SUPPORTED_DOCUMENT_MIME_TYPES: frozenset[str] = frozenset(get_args(DocumentMimeType))
 
@@ -184,3 +186,31 @@ def sniff_and_validate_document_bytes(data: bytes) -> DocumentMimeType:
     elif detected == "image/jpeg":
         _validate_jpeg_structure(data)
     return detected
+
+
+def _validate_webp_structure(data: bytes) -> None:
+    """Verify bounded RIFF/WEBP container header and declared size."""
+    if len(data) < 20 or not (data[:4] == b"RIFF" and data[8:12] == b"WEBP"):
+        _raise_malformed("WebP header is invalid or truncated")
+    riff_size = int.from_bytes(data[4:8], "little")
+    if riff_size < 12 or riff_size + 8 > len(data):
+        _raise_malformed("WebP RIFF chunk size is truncated or invalid")
+
+
+def sniff_and_validate_project_image_bytes(data: bytes) -> ProjectImageMimeType:
+    """Sniff magic bytes and verify bounded structural integrity for JPEG/PNG/WebP images."""
+    if data.startswith(b"\xff\xd8\xff"):
+        _validate_jpeg_structure(data)
+        return "image/jpeg"
+    if data.startswith(_PNG_SIGNATURE):
+        _validate_png_structure(data)
+        return "image/png"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        _validate_webp_structure(data)
+        return "image/webp"
+    raise AppException(
+        message="Unsupported project image file signature",
+        status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+        public_message="Unsupported image format. Only JPEG, PNG, and WebP images are allowed.",
+        error_code="UNSUPPORTED_FILE_TYPE",
+    )

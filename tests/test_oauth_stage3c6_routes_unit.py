@@ -582,3 +582,44 @@ def test_oauth_exchange_csrf_cookie_matrix_500_429_and_me_providers(
         assert r_me.status_code == 200
         assert r_me.json()["oauth_providers"] == ["github", "google"]
         assert r_me.headers.get("referrer-policy") is None
+
+
+def test_oauth_github_login_start_route_and_legacy_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify Stage 3C GitHub login uses /auth/oauth/github/start and does not expose /auth/github."""
+    cfg, app = _make_app()
+    _, challenge = _exchange_pair()
+
+    monkeypatch.setattr(
+        oauth_service,
+        "start_oauth_flow",
+        lambda db, **kw: OAuthStartResult(
+            authorization_url="https://github.com/login/oauth/authorize?client_id=login-id&state=s1",
+            client_type=kw["client_type"],
+            binding_cookie_value="gh-bind-secret",
+        ),
+    )
+
+    with TestClient(app) as client:
+        r_start = client.get(
+            "/api/v1/auth/oauth/github/start",
+            params={
+                "client_type": "web",
+                "redirect_uri": "http://localhost:5173/auth/oauth/callback",
+                "exchange_code_challenge": challenge,
+                "exchange_code_challenge_method": "S256",
+            },
+            follow_redirects=False,
+        )
+        assert r_start.status_code == 302
+        assert r_start.headers["location"].startswith("https://github.com/login/oauth/authorize?")
+        _assert_oauth_security_headers(r_start.headers)
+        assert any(
+            h.startswith(f"{cfg.OAUTH_BINDING_COOKIE_NAME}=")
+            for h in r_start.headers.get_list("set-cookie")
+        )
+
+        # Unregistered legacy path must remain 404 (no duplicate route)
+        r_legacy = client.get("/api/v1/auth/github", follow_redirects=False)
+        assert r_legacy.status_code == 404

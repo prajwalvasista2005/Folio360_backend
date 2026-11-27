@@ -24,7 +24,9 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base import Base, TimestampMixin
 
 if TYPE_CHECKING:
+    from app.models.certificate import AchievementDocument, Certificate
     from app.models.education import Education
+    from app.models.experience import ExperienceDocument
 
 DOCUMENT_CATEGORIES: tuple[str, ...] = (
     "marksheet",
@@ -229,6 +231,20 @@ class Document(Base, TimestampMixin):
 
     education_links: Mapped[list["EducationDocument"]] = relationship(
         "EducationDocument",
+        back_populates="document",
+        cascade="all, delete-orphan",
+    )
+    certificates: Mapped[list["Certificate"]] = relationship(
+        "Certificate",
+        back_populates="document",
+    )
+    achievement_links: Mapped[list["AchievementDocument"]] = relationship(
+        "AchievementDocument",
+        back_populates="document",
+        cascade="all, delete-orphan",
+    )
+    experience_links: Mapped[list["ExperienceDocument"]] = relationship(
+        "ExperienceDocument",
         back_populates="document",
         cascade="all, delete-orphan",
     )

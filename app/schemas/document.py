@@ -97,7 +97,7 @@ class DocumentCategoriesResponse(BaseModel):
 class DocumentAttachedToItem(BaseModel):
     """Entity reference indicating where a document is currently attached."""
 
-    entity_type: Literal["education"]
+    entity_type: Literal["education", "certificate", "achievement", "experience"]
     entity_id: uuid.UUID
     label: str
 
