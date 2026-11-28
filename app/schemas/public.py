@@ -110,13 +110,28 @@ class PublicProfileExperience(BaseModel):
     featured: bool = False
 
 
+class PublicProfileSkill(BaseModel):
+    """Publicly visible skill summary (excludes private internal IDs)."""
+
+    name: str
+    category: str
+    proficiency: str | None = None
+
+
+class PublicProfileAcademics(BaseModel):
+    """Publicly visible academic CGPA summary when explicitly enabled."""
+
+    cgpa: float
+
+
 class PublicProfileSections(BaseModel):
     """Public sections payload matching frontend PublicProfile.sections."""
 
     education: list[PublicProfileEducation] = Field(default_factory=list)
     education_documents: list[DocumentRef] = Field(default_factory=list)
+    academics: PublicProfileAcademics | None = None
     projects: list[PublicProfileProject] = Field(default_factory=list)
-    skills: list[dict[str, object]] = Field(default_factory=list)
+    skills: list[PublicProfileSkill] = Field(default_factory=list)
     certificates: list[PublicProfileCertificate] = Field(default_factory=list)
     experience: list[PublicProfileExperience] = Field(default_factory=list)
     achievements: list[PublicProfileAchievement] = Field(default_factory=list)

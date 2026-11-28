@@ -135,6 +135,9 @@ class MeResponse(UserPublicResponse):
 
     updated_at: datetime
     oauth_providers: list[str] = Field(default_factory=list)
+    full_name: str | None = None
+    slug: str | None = None
+    avatar_url: str | None = None
 
 
 class RegisterResponse(BaseModel):
@@ -178,6 +181,23 @@ class LogoutResponse(BaseModel):
     """Response payload for POST /logout and POST /logout-all."""
 
     message: str
+
+
+class SessionItemResponse(BaseModel):
+    """Sanitized active refresh session metadata for Settings."""
+
+    id: uuid.UUID
+    client_type: Literal["web", "mobile"]
+    device_label: str
+    created_at: datetime
+    last_used_at: datetime
+    current: bool = False
+
+
+class SessionListResponse(BaseModel):
+    """Response payload for GET /api/v1/auth/sessions."""
+
+    items: list[SessionItemResponse]
 
 
 def _strip_nonempty_token(value: Any, field_label: str) -> str:

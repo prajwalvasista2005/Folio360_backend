@@ -1,7 +1,7 @@
 """SQLAlchemy ORM models for Phase 1 UserProfile and UserProfileActivity."""
 
 from datetime import date, datetime
-from typing import Optional
+from typing import Any, Optional
 import uuid
 
 from sqlalchemy import (
@@ -24,6 +24,8 @@ from app.core.username import ACTIVITY_KEYS
 from app.db.base import Base, TimestampMixin
 
 _ACTIVITY_KEYS_SQL = ", ".join(f"'{key}'" for key in ACTIVITY_KEYS)
+THEME_PREFERENCES: tuple[str, ...] = ("light", "dark", "system")
+_THEME_PREFERENCES_SQL = ", ".join(f"'{pref}'" for pref in THEME_PREFERENCES)
 
 
 class UserProfile(Base, TimestampMixin):
@@ -47,9 +49,27 @@ class UserProfile(Base, TimestampMixin):
         CheckConstraint(
             "bio IS NULL OR ("
             "bio = btrim(bio) "
-            "AND char_length(bio) BETWEEN 1 AND 500"
+            "AND char_length(bio) BETWEEN 1 AND 1000"
             ")",
             name="bio_valid",
+        ),
+        CheckConstraint(
+            "headline IS NULL OR ("
+            "headline = btrim(headline) "
+            "AND char_length(headline) BETWEEN 1 AND 120"
+            ")",
+            name="headline_valid",
+        ),
+        CheckConstraint(
+            "location IS NULL OR ("
+            "location = btrim(location) "
+            "AND char_length(location) BETWEEN 1 AND 120"
+            ")",
+            name="location_valid",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(links) = 'object'",
+            name="links_object",
         ),
         CheckConstraint(
             "profile_picture_url IS NULL OR ("
@@ -62,6 +82,14 @@ class UserProfile(Base, TimestampMixin):
         CheckConstraint(
             "jsonb_typeof(interests) = 'array'",
             name="interests_array",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(visibility_settings) = 'object'",
+            name="visibility_settings_object",
+        ),
+        CheckConstraint(
+            f"theme_preference IN ({_THEME_PREFERENCES_SQL})",
+            name="theme_preference_valid",
         ),
         CheckConstraint(
             "(profile_completed = false AND profile_completed_at IS NULL) OR ("
@@ -99,12 +127,45 @@ class UserProfile(Base, TimestampMixin):
         nullable=True,
     )
     bio: Mapped[Optional[str]] = mapped_column(
-        String(500),
+        String(1000),
         nullable=True,
     )
-    # Transitional Phase 1 URL field (mapped to API avatar_url); object storage is deferred.
+    headline: Mapped[Optional[str]] = mapped_column(
+        String(120),
+        nullable=True,
+    )
+    location: Mapped[Optional[str]] = mapped_column(
+        String(120),
+        nullable=True,
+    )
+    contact_email: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+    phone: Mapped[Optional[str]] = mapped_column(
+        String(32),
+        nullable=True,
+    )
+    website: Mapped[Optional[str]] = mapped_column(
+        String(512),
+        nullable=True,
+    )
+    links: Mapped[dict[str, Any]] = mapped_column(
+        JSONB(),
+        default=dict,
+        server_default=text("'{}'::jsonb"),
+        nullable=False,
+    )
     profile_picture_url: Mapped[Optional[str]] = mapped_column(
         String(512),
+        nullable=True,
+    )
+    avatar_storage_key: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+    avatar_mime_type: Mapped[Optional[str]] = mapped_column(
+        String(32),
         nullable=True,
     )
     interests: Mapped[list[str]] = mapped_column(
@@ -122,6 +183,18 @@ class UserProfile(Base, TimestampMixin):
     profile_completed_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
+    )
+    visibility_settings: Mapped[dict[str, Any]] = mapped_column(
+        JSONB(),
+        default=dict,
+        server_default=text("'{}'::jsonb"),
+        nullable=False,
+    )
+    theme_preference: Mapped[str] = mapped_column(
+        String(16),
+        default="light",
+        server_default=text("'light'"),
+        nullable=False,
     )
 
     activities: Mapped[list["UserProfileActivity"]] = relationship(

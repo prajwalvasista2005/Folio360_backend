@@ -1,6 +1,7 @@
 """SQLAlchemy ORM model exports for application and Alembic metadata discovery."""
 
 from app.db.base import Base
+from app.models.account import EmailChangeToken, SecurityAuditEvent
 from app.models.certificate import (
     Achievement,
     AchievementDocument,
@@ -24,6 +25,8 @@ from app.models.user import User
 __all__ = [
     "Base",
     "User",
+    "EmailChangeToken",
+    "SecurityAuditEvent",
     "EmailVerificationToken",
     "PasswordResetToken",
     "RefreshSession",

@@ -11,7 +11,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
-from app.core.exceptions import AppException, ValidationAppError, auth_error
+from app.core.exceptions import (
+    AppException,
+    ResourceNotFoundError,
+    ValidationAppError,
+    auth_error,
+)
 from app.core.security import (
     DUMMY_PASSWORD_HASH,
     create_access_token,
@@ -27,6 +32,7 @@ from app.models.email_verification_token import EmailVerificationToken
 from app.models.password_reset_token import PasswordResetToken
 from app.models.refresh_session import RefreshSession
 from app.models.user import User
+from app.services.account_service import record_security_event
 from app.services.email_service import (
     EmailSendResult,
     send_password_reset_email,
@@ -526,6 +532,16 @@ def login_user(
     password_matches = verify_password(password, candidate_hash)
 
     if user is None or user.password_hash is None or not password_matches:
+        if user is not None:
+            record_security_event(
+                db,
+                user_id=user.id,
+                action="login_failed",
+                ip_address=ip_address,
+                user_agent=user_agent,
+                client_type=client_type,
+            )
+            db.commit()
         raise auth_error(
             status_code=status.HTTP_401_UNAUTHORIZED,
             code="INVALID_CREDENTIALS",
@@ -549,6 +565,15 @@ def login_user(
     now = datetime.now(timezone.utc)
     if password_needs_rehash(user.password_hash):
         user.password_hash = hash_password(password)
+
+    record_security_event(
+        db,
+        user_id=user.id,
+        action="login_success",
+        ip_address=ip_address,
+        user_agent=user_agent,
+        client_type=client_type,
+    )
 
     return _create_session_and_mint_tokens(
         db,
@@ -836,6 +861,7 @@ def logout_all_sessions(
         )
         .values(revoked_at=now, revoke_reason="logout_all")
     )
+    record_security_event(db, user_id=user.id, action="logout_all")
     db.commit()
 
 
@@ -1084,6 +1110,14 @@ def change_password(
         )
         .values(revoked_at=now, revoke_reason="password_changed")
     )
+    record_security_event(
+        db,
+        user_id=user.id,
+        action="password_changed",
+        ip_address=ip_address,
+        user_agent=user_agent,
+        client_type=client_type,
+    )
 
     return _create_session_and_mint_tokens(
         db,
@@ -1094,3 +1128,107 @@ def change_password(
         now=now,
         settings=settings,
     )
+
+
+def _format_device_label(user_agent: str | None, client_type: str) -> str:
+    if not user_agent or not user_agent.strip():
+        return "Mobile app session" if client_type == "mobile" else "Web browser session"
+    ua = user_agent.strip()
+    browser = "Browser"
+    if "Edg/" in ua:
+        browser = "Edge"
+    elif "Chrome/" in ua and "Chromium" not in ua:
+        browser = "Chrome"
+    elif "Firefox/" in ua:
+        browser = "Firefox"
+    elif "Safari/" in ua and "Chrome/" not in ua:
+        browser = "Safari"
+    elif "curl/" in ua.lower():
+        browser = "curl"
+
+    platform = "Unknown OS"
+    if "Windows" in ua:
+        platform = "Windows"
+    elif "Mac OS X" in ua or "Macintosh" in ua:
+        platform = "macOS"
+    elif "Android" in ua:
+        platform = "Android"
+    elif "iPhone" in ua or "iPad" in ua:
+        platform = "iOS"
+    elif "Linux" in ua:
+        platform = "Linux"
+
+    return f"{browser} on {platform}"
+
+
+def list_active_sessions(
+    db: Session,
+    *,
+    user_id: uuid.UUID,
+    current_raw_refresh_token: str | None = None,
+) -> list[dict]:
+    """List active (non-revoked, unexpired) refresh sessions owned by user_id."""
+    now = datetime.now(timezone.utc)
+    current_token_hash = (
+        hash_opaque_token(current_raw_refresh_token.strip())
+        if current_raw_refresh_token and current_raw_refresh_token.strip()
+        else None
+    )
+    rows = list(
+        db.execute(
+            select(RefreshSession)
+            .where(
+                RefreshSession.user_id == user_id,
+                RefreshSession.revoked_at.is_(None),
+                RefreshSession.expires_at > now,
+            )
+            .order_by(
+                RefreshSession.last_used_at.desc().nulls_last(),
+                RefreshSession.created_at.desc(),
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [
+        {
+            "id": row.id,
+            "client_type": row.client_type,
+            "device_label": _format_device_label(row.user_agent, row.client_type),
+            "created_at": row.created_at,
+            "last_used_at": row.last_used_at or row.created_at,
+            "current": (
+                current_token_hash is not None
+                and row.token_hash == current_token_hash
+            ),
+        }
+        for row in rows
+    ]
+
+
+def revoke_user_session(
+    db: Session,
+    *,
+    user_id: uuid.UUID,
+    session_id: uuid.UUID,
+) -> None:
+    """Revoke a single active refresh session owned by user_id."""
+    session_row = db.execute(
+        select(RefreshSession)
+        .where(
+            RefreshSession.id == session_id,
+            RefreshSession.user_id == user_id,
+        )
+        .with_for_update()
+    ).scalar_one_or_none()
+    if session_row is None or session_row.revoked_at is not None:
+        db.rollback()
+        raise ResourceNotFoundError(
+            message="Session not found",
+            public_message="Active session not found.",
+            error_code="SESSION_NOT_FOUND",
+        )
+    session_row.revoked_at = datetime.now(timezone.utc)
+    session_row.revoke_reason = "user_revoked"
+    record_security_event(db, user_id=user_id, action="session_revoked")
+    db.commit()

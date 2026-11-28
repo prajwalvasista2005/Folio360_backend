@@ -2,8 +2,10 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 import threading
 import uuid
+import zlib
 
 from fastapi.testclient import TestClient
 import pytest
@@ -22,6 +24,7 @@ def _build_test_app(
     *,
     environment: str = "testing",
     rate_limit_enabled: bool = True,
+    storage_dir: str | None = None,
 ) -> tuple[Settings, object]:
     settings = Settings(
         _env_file=None,
@@ -38,6 +41,9 @@ def _build_test_app(
         RESEND_API_KEY="re_profile_integration_mock_key",
         EMAIL_FROM_ADDRESS="no-reply@folio360.com",
         RATE_LIMIT_ENABLED=rate_limit_enabled,
+        STORAGE_BACKEND="local",
+        DOCUMENT_LOCAL_STORAGE_DIR=storage_dir or "/tmp/folio360_profile_test_storage",
+        MALWARE_SCANNER_BACKEND="mock",
     )
     return settings, create_app(settings=settings)
 
@@ -340,9 +346,9 @@ def test_full_profile_creation_flow_and_auth_completion_integration(
         assert clear_name_resp.json()["error"]["code"] == "VALIDATION_ERROR"
         assert clear_name_resp.json()["error"]["details"] is None
 
-        # Avatar upload/removal endpoints remain deferred (not implemented)
-        assert client.post("/api/v1/profile/me/avatar", headers=new_headers).status_code in {404, 405}
-        assert client.delete("/api/v1/profile/me/avatar", headers=new_headers).status_code in {404, 405}
+        # Avatar endpoints exist: missing file yields 422 and idempotent DELETE returns 204
+        assert client.post("/api/v1/profile/me/avatar", headers=new_headers).status_code == 422
+        assert client.delete("/api/v1/profile/me/avatar", headers=new_headers).status_code == 204
 
 
 @pytest.mark.db
@@ -690,3 +696,222 @@ def test_oauth_exchange_returns_profile_completed_false_then_true_without_dob(
             assert "date_of_birth" not in second_exchange["user"]
     finally:
         _clean_oauth_tables()
+
+
+def _build_minimal_png(width: int = 2, height: int = 2) -> bytes:
+    def _chunk(tag: bytes, payload: bytes) -> bytes:
+        crc = zlib.crc32(tag + payload) & 0xFFFFFFFF
+        return len(payload).to_bytes(4, "big") + tag + payload + crc.to_bytes(4, "big")
+
+    ihdr = width.to_bytes(4, "big") + height.to_bytes(4, "big") + bytes([8, 2, 0, 0, 0])
+    idat = zlib.compress(b"\x00" * (height * (1 + width * 3)))
+    return b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", ihdr) + _chunk(b"IDAT", idat) + _chunk(b"IEND", b"")
+
+
+@pytest.mark.db
+def test_personal_profile_full_update_and_public_visibility_enforcement(
+    test_database_url: str,
+    db_engine: Engine,
+    clean_profile_db: None,
+) -> None:
+    """Verify full Personal Profile persistence (including 1000-char bio, links, interests, activities) and strict public contact visibility."""
+    del clean_profile_db
+    settings, app = _build_test_app(test_database_url, rate_limit_enabled=False)
+    user = _create_db_user(db_engine, email="login.private@example.com")
+    headers = _auth_headers(user, settings)
+
+    with TestClient(app) as client:  # type: ignore[arg-type]
+        assert (
+            client.patch(
+                "/api/v1/profile/me/slug",
+                headers=headers,
+                json={"slug": "alex_profile"},
+            ).status_code
+            == 200
+        )
+        long_bio = "B" * 1000
+        patch_res = client.patch(
+            "/api/v1/profile/me",
+            headers=headers,
+            json={
+                "full_name": "Alex Mercer",
+                "date_of_birth": "2003-04-12",
+                "headline": "Systems & Full-Stack Student",
+                "bio": long_bio,
+                "location": "Bengaluru, IN",
+                "contact_email": "public.hello@example.dev",
+                "phone": "+91 98765 00001",
+                "website": "https://alex.dev",
+                "links": {
+                    "linkedin": "https://linkedin.com/in/alex_mercer",
+                    "github": "https://github.com/alex_mercer",
+                    "other": [{"label": "Portfolio", "url": "https://work.alex.dev"}],
+                },
+                "interests": ["Distributed Systems", "Open Source"],
+                "current_activities": [
+                    {"key": "studying", "description": "B.Tech CSE"},
+                    {"key": "other", "label": "Mentor", "description": "Freshmen club"},
+                ],
+                "profile_completed": True,
+            },
+        )
+        assert patch_res.status_code == 200
+        body = patch_res.json()
+        assert body["public_url"] == "/@alex_profile"
+        assert body["headline"] == "Systems & Full-Stack Student"
+        assert body["bio"] == long_bio
+        assert body["location"] == "Bengaluru, IN"
+        assert body["contact_email"] == "public.hello@example.dev"
+        assert body["phone"] == "+91 98765 00001"
+        assert body["website"] == "https://alex.dev"
+        assert body["links"] == {
+            "linkedin": "https://linkedin.com/in/alex_mercer",
+            "github": "https://github.com/alex_mercer",
+            "other": [{"label": "Portfolio", "url": "https://work.alex.dev"}],
+        }
+        assert body["interests"] == ["Distributed Systems", "Open Source"]
+        assert len(body["current_activities"]) == 2
+
+        # Validation rejects invalid URL / contact email
+        assert (
+            client.patch(
+                "/api/v1/profile/me",
+                headers=headers,
+                json={"website": "javascript:alert(1)"},
+            ).status_code
+            == 422
+        )
+        assert (
+            client.patch(
+                "/api/v1/profile/me",
+                headers=headers,
+                json={"contact_email": "not-an-email"},
+            ).status_code
+            == 422
+        )
+
+        # /auth/me reflects updated full_name and slug
+        me_res = client.get("/api/v1/auth/me", headers=headers)
+        assert me_res.status_code == 200
+        assert me_res.json()["full_name"] == "Alex Mercer"
+        assert me_res.json()["slug"] == "alex_profile"
+
+        # Public profile hides location, contact_email, phone by default
+        pub_hidden = client.get("/api/v1/public/profiles/alex_profile")
+        assert pub_hidden.status_code == 200
+        pub_h = pub_hidden.json()
+        assert pub_h["headline"] == "Systems & Full-Stack Student"
+        assert pub_h["bio"] == long_bio
+        assert pub_h["location"] is None
+        assert pub_h["contact_email"] is None
+        assert pub_h["phone"] is None
+        assert pub_h["links"] == {
+            "linkedin": "https://linkedin.com/in/alex_mercer",
+            "github": "https://github.com/alex_mercer",
+            "website": "https://alex.dev",
+            "other": [{"label": "Portfolio", "url": "https://work.alex.dev"}],
+        }
+
+        # Enable public contact visibility toggles
+        assert (
+            client.patch(
+                "/api/v1/profile/me/visibility",
+                headers=headers,
+                json={
+                    "public_contact": {
+                        "show_location": True,
+                        "show_email": True,
+                        "show_phone": True,
+                    }
+                },
+            ).status_code
+            == 200
+        )
+
+        pub_shown = client.get("/api/v1/public/profiles/alex_profile")
+        assert pub_shown.status_code == 200
+        pub_s = pub_shown.json()
+        assert pub_s["location"] == "Bengaluru, IN"
+        assert pub_s["contact_email"] == "public.hello@example.dev"
+        assert pub_s["contact_email"] != "login.private@example.com"
+        assert pub_s["phone"] == "+91 98765 00001"
+
+
+@pytest.mark.db
+def test_profile_avatar_upload_replace_serve_and_delete(
+    test_database_url: str,
+    db_engine: Engine,
+    tmp_path: Path,
+    clean_profile_db: None,
+) -> None:
+    """Verify avatar upload, validation, safe serving, replacement cleanup, and deletion."""
+    del clean_profile_db
+    settings, app = _build_test_app(
+        test_database_url,
+        rate_limit_enabled=False,
+        storage_dir=str(tmp_path),
+    )
+    user = _create_db_user(db_engine, email="avatar.owner@example.com")
+    headers = _auth_headers(user, settings)
+    png_v1 = _build_minimal_png(2, 2)
+    png_v2 = _build_minimal_png(3, 3)
+
+    with TestClient(app) as client:  # type: ignore[arg-type]
+        # Reject unsupported format and oversized uploads
+        bad_type = client.post(
+            "/api/v1/profile/me/avatar",
+            headers=headers,
+            files={"file": ("avatar.txt", b"plain text", "text/plain")},
+        )
+        assert bad_type.status_code == 415
+
+        too_large = client.post(
+            "/api/v1/profile/me/avatar",
+            headers=headers,
+            files={"file": ("big.png", b"A" * (5 * 1024 * 1024 + 10), "image/png")},
+        )
+        assert too_large.status_code == 413
+
+        # Upload valid PNG
+        up1 = client.post(
+            "/api/v1/profile/me/avatar",
+            headers=headers,
+            files={"file": ("avatar.png", png_v1, "image/png")},
+        )
+        assert up1.status_code == 200
+        avatar_url_1 = up1.json()["avatar_url"]
+        assert avatar_url_1.startswith("/api/v1/profile/avatars/")
+
+        # Serve image bytes safely
+        served1 = client.get(avatar_url_1)
+        assert served1.status_code == 200
+        assert served1.content == png_v1
+        assert served1.headers["content-type"].startswith("image/png")
+        assert served1.headers["x-content-type-options"] == "nosniff"
+
+        # /auth/me and /profile/me report avatar_url
+        assert client.get("/api/v1/profile/me", headers=headers).json()["avatar_url"] == avatar_url_1
+        assert client.get("/api/v1/auth/me", headers=headers).json()["avatar_url"] == avatar_url_1
+
+        # Replace with a second PNG -> old stored blob is removed
+        up2 = client.post(
+            "/api/v1/profile/me/avatar",
+            headers=headers,
+            files={"file": ("avatar2.png", png_v2, "image/png")},
+        )
+        assert up2.status_code == 200
+        avatar_url_2 = up2.json()["avatar_url"]
+        assert avatar_url_2 != avatar_url_1
+        assert len([p for p in tmp_path.rglob("*") if p.is_file()]) == 1
+
+        served2 = client.get(avatar_url_2)
+        assert served2.status_code == 200
+        assert served2.content == png_v2
+
+        # Delete avatar -> 204, clears URL, deletes file, GET returns 404
+        del_res = client.delete("/api/v1/profile/me/avatar", headers=headers)
+        assert del_res.status_code == 204
+        assert client.get("/api/v1/profile/me", headers=headers).json()["avatar_url"] is None
+        assert client.get("/api/v1/auth/me", headers=headers).json()["avatar_url"] is None
+        assert len([p for p in tmp_path.rglob("*") if p.is_file()]) == 0
+        assert client.get(avatar_url_2).status_code == 404

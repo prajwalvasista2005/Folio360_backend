@@ -22,6 +22,8 @@ from app.schemas.auth import MeResponse, UserPublicResponse
 from app.schemas.profile import (
     PrivateProfileResponse,
     ProfileActivityInput,
+    ProfileLinkItem,
+    ProfileLinksInput,
     ProfileUpdateRequest,
     SlugUpdateRequest,
 )
@@ -234,10 +236,38 @@ def test_profile_update_request_validation_boundaries() -> None:
     with pytest.raises(ValidationError):
         ProfileUpdateRequest(profile_completed=None)
 
-    # Reject out-of-scope Profile Management fields via extra='forbid'
-    for forbidden_field in ("location", "social_links", "phone", "slug"):
+    # Reject out-of-scope / immutable fields via extra='forbid'
+    for forbidden_field in ("social_links", "slug", "unknown_field"):
         with pytest.raises(ValidationError):
             ProfileUpdateRequest(**{forbidden_field: "value"})  # type: ignore[arg-type]
+
+    # Personal profile fields & link validation
+    full_req = ProfileUpdateRequest(
+        headline="  Full-Stack Engineer  ",
+        location="  Bengaluru, IN  ",
+        contact_email="  Contact@Example.com  ",
+        phone="  +91 98765 43210  ",
+        website="https://example.dev",
+        links=ProfileLinksInput(
+            linkedin="https://linkedin.com/in/example",
+            github="https://github.com/example",
+            other=[ProfileLinkItem(label="  Portfolio  ", url="https://portfolio.example.com")],
+        ),
+    )
+    assert full_req.headline == "Full-Stack Engineer"
+    assert full_req.location == "Bengaluru, IN"
+    assert full_req.contact_email == "contact@example.com"
+    assert full_req.phone == "+91 98765 43210"
+    assert full_req.website == "https://example.dev"
+    assert full_req.links is not None
+    assert full_req.links.other[0].label == "Portfolio"
+
+    with pytest.raises(ValidationError):
+        ProfileUpdateRequest(website="javascript:alert(1)")
+    with pytest.raises(ValidationError):
+        ProfileUpdateRequest(contact_email="not-an-email")
+    with pytest.raises(ValidationError):
+        ProfileLinksInput(linkedin="ftp://example.com/in/a")
 
     # SlugUpdateRequest extra='forbid'
     slug_req = SlugUpdateRequest(slug="  Valid_User_1 ")
@@ -304,9 +334,9 @@ def test_multiline_bio_and_activity_description_normalization_and_control_char_p
     assert req_blank.current_activities is not None
     assert req_blank.current_activities[0].description is None
 
-    assert len(ProfileUpdateRequest(bio="a" * 500).bio or "") == 500
+    assert len(ProfileUpdateRequest(bio="a" * 1000).bio or "") == 1000
     with pytest.raises(ValidationError):
-        ProfileUpdateRequest(bio="a" * 501)
+        ProfileUpdateRequest(bio="a" * 1001)
     assert len(ProfileActivityInput(key="working", description="d" * 200).description or "") == 200
     with pytest.raises(ValidationError):
         ProfileActivityInput(key="working", description="d" * 201)

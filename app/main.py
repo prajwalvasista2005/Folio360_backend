@@ -13,7 +13,9 @@ from starlette.types import Receive, Scope, Send
 import uvicorn.config
 
 from app.api.routes import (
+    account,
     achievements,
+    analytics,
     auth,
     certificates,
     document_analysis,
@@ -229,6 +231,8 @@ def create_app(settings: Settings | None = None) -> Folio360FastAPI:
     api_v1_router.include_router(certificates.router)
     api_v1_router.include_router(achievements.router)
     api_v1_router.include_router(experience.router)
+    api_v1_router.include_router(analytics.router)
+    api_v1_router.include_router(account.router)
     application.include_router(api_v1_router)
 
     return application

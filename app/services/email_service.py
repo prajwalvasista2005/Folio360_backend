@@ -39,6 +39,13 @@ def build_password_reset_url(frontend_base_url: str, raw_token: str) -> str:
     return f"{base}/reset-password?{query}"
 
 
+def build_email_change_confirm_url(frontend_base_url: str, raw_token: str) -> str:
+    """Build {FRONTEND_BASE_URL}/workspace/settings?email_change_token=<raw>."""
+    base = frontend_base_url.rstrip("/")
+    query = urlencode({"email_change_token": raw_token})
+    return f"{base}/workspace/settings?{query}"
+
+
 def _resolve_sender_address(configured_from: str, smtp_user: str) -> str:
     """Resolve the RFC 5322 sender email address, falling back to SMTP_USER for dev defaults."""
     _, parsed_addr = parseaddr((configured_from or "").strip())
@@ -183,6 +190,37 @@ def send_password_reset_email(
     return send_email(
         to_email=to_email,
         subject="Reset your Folio360 password",
+        html_content=html_content,
+        text_content=text_content,
+        settings=settings,
+    )
+
+
+def send_email_change_verification_email(
+    *,
+    to_email: str,
+    raw_token: str,
+    settings: Settings,
+) -> EmailSendResult:
+    """Deliver an email-change confirmation link via SMTP outside any DB transaction."""
+    confirm_url = build_email_change_confirm_url(settings.FRONTEND_BASE_URL, raw_token)
+    escaped_url = escape(confirm_url, quote=True)
+
+    html_content = (
+        "<p>Confirm your new Folio360 email address.</p>"
+        f'<p>Open <a href="{escaped_url}">Confirm Email Change</a> to verify this address.</p>'
+        "<p>This link expires in 24 hours and can only be used once. "
+        "If you did not request this change, you can safely ignore this email.</p>"
+    )
+    text_content = (
+        "Confirm your new Folio360 email address.\n\n"
+        f"Open:\n{confirm_url}\n\n"
+        "This link expires in 24 hours and can only be used once."
+    )
+
+    return send_email(
+        to_email=to_email,
+        subject="Confirm your new Folio360 email address",
         html_content=html_content,
         text_content=text_content,
         settings=settings,

@@ -1,6 +1,7 @@
 """Stage 3A/3B synchronous authentication routes under /api/v1/auth/*."""
 
 from typing import Optional
+import uuid
 
 from fastapi import APIRouter, Body, Depends, Request, Response, status
 from sqlalchemy.orm import Session
@@ -12,6 +13,7 @@ from app.api.deps.auth import (
     get_current_auth_context,
     get_current_settings,
     get_current_user,
+    get_current_verified_user,
     optional_client_type,
     rate_limit_dependency,
     require_client_type,
@@ -37,6 +39,8 @@ from app.schemas.auth import (
     ResendVerificationRequest,
     ResetPasswordRequest,
     ResetPasswordResponse,
+    SessionItemResponse,
+    SessionListResponse,
     UserPublicResponse,
     VerifyEmailRequest,
     VerifyEmailResponse,
@@ -386,6 +390,14 @@ def get_me(
         db,
         user_id=current_user.id,
     )
+    profile_summary = (
+        profile_service.get_profile_identity_summary(
+            db,
+            user_id=current_user.id,
+        )
+        if hasattr(db, "execute")
+        else {"full_name": None, "slug": None, "avatar_url": None}
+    )
     return MeResponse(
         id=current_user.id,
         email=current_user.email,
@@ -396,6 +408,9 @@ def get_me(
         created_at=current_user.created_at,
         updated_at=current_user.updated_at,
         oauth_providers=oauth_providers,
+        full_name=profile_summary["full_name"],
+        slug=profile_summary["slug"],
+        avatar_url=profile_summary["avatar_url"],
     )
 
 
@@ -509,3 +524,44 @@ def change_password(
         refresh_expires_in=refresh_expires_in,
         user=user_public,
     )
+
+
+@router.get(
+    "/sessions",
+    response_model=SessionListResponse,
+    status_code=status.HTTP_200_OK,
+    summary="List active refresh sessions for the authenticated user",
+)
+def list_sessions(
+    request: Request,
+    current_user: User = Depends(get_current_verified_user),
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_current_settings),
+) -> SessionListResponse:
+    """List active sessions owned by the authenticated user without exposing token secrets."""
+    raw_refresh = request.cookies.get(settings.REFRESH_COOKIE_NAME)
+    rows = auth_service.list_active_sessions(
+        db,
+        user_id=current_user.id,
+        current_raw_refresh_token=raw_refresh,
+    )
+    return SessionListResponse(items=[SessionItemResponse(**row) for row in rows])
+
+
+@router.delete(
+    "/sessions/{session_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Revoke an active refresh session owned by the authenticated user",
+)
+def revoke_session(
+    session_id: uuid.UUID,
+    current_user: User = Depends(get_current_verified_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    """Revoke one active refresh session owned by the authenticated user."""
+    auth_service.revoke_user_session(
+        db,
+        user_id=current_user.id,
+        session_id=session_id,
+    )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
